@@ -1,11 +1,17 @@
-import os, time, math
-from collections import deque
+import math
+import time
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-LIVE_STATE = {"last_update": "--:--:--", "micro": {}, "ticks": {}, "heavyweights": [], "chains": {}, "analytics": {}}
-ROLLING_HISTORY = {"NIFTY": deque(maxlen=900), "BN": deque(maxlen=900), "SX": deque(maxlen=900)}
+LATEST_STATE = {
+    "ts": 0,
+    "micro": {"mode": "WAITING FOR BRIDGE...", "ticks_per_sec": 0},
+    "ticks": {},
+    "heavyweights": [],
+    "chains": {"NIFTY": [], "BN": [], "SX": []},
+    "stock_chains": {}
+}
 
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -14,627 +20,699 @@ def norm_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
 def bs_greeks(S, K, T, r, sigma, optt):
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return 0.0, 0.0, 0.0, 0.0
-    sqrtT = math.sqrt(T)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
-    d2 = d1 - sigma * sqrtT
-    gamma = norm_pdf(d1) / (S * sigma * sqrtT)
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    pdf = norm_pdf(d1)
     if optt == "CE":
-        price = S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
         delta = norm_cdf(d1)
-        theta = (-(S * norm_pdf(d1) * sigma) / (2 * sqrtT) - r * K * math.exp(-r * T) * norm_cdf(d2)) / 365.0
+        theta = (-S * pdf * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * norm_cdf(d2)) / 365.0
     else:
-        price = K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
         delta = norm_cdf(d1) - 1.0
-        theta = (-(S * norm_pdf(d1) * sigma) / (2 * sqrtT) + r * K * math.exp(-r * T) * norm_cdf(-d2)) / 365.0
-    return price, delta, gamma, theta
-
-def solve_greeks(S, K, mkt_price, optt, T=7/365.0, r=0.07):
-    intrinsic = max(0.0, S - K) if optt == "CE" else max(0.0, K - S)
-    if mkt_price <= intrinsic + 0.5:
-        d = (1.0 if S > K else 0.0) if optt == "CE" else (-1.0 if S < K else 0.0)
-        return 12.0, round(d, 2), 0.0001, -1.5
-    low, high = 0.03, 2.5
-    for _ in range(22):
-        mid = 0.5 * (low + high)
-        p, _, _, _ = bs_greeks(S, K, T, r, mid, optt)
-        if p < mkt_price:
-            low = mid
-        else:
-            high = mid
-    iv = 0.5 * (low + high)
-    _, delta, gamma, theta = bs_greeks(S, K, T, r, iv, optt)
-    return round(iv * 100, 1), round(delta, 2), round(gamma, 5), round(theta, 2)
-
-def analyze_heavyweights(hws, nifty_sp, bn_sp):
-    enriched = []
-    nifty_pts = 0.0
-    bn_pts = 0.0
-    adv = 0
-    for h in hws:
-        chg = float(h.get("chg_pct", 0) or 0)
-        wt = float(h.get("wt", 0) or 0)
-        doi = int(h.get("fut_doi", 0) or 0)
-        if chg > 0: adv += 1
-        n_contrib = round((nifty_sp * (wt / 100.0) * (chg / 100.0)), 1) if nifty_sp else 0.0
-        nifty_pts += n_contrib
-        if h.get("bn"):
-            bn_wt = wt * 3.1
-            bn_pts += round((bn_sp * (bn_wt / 100.0) * (chg / 100.0)), 1) if bn_sp else 0.0
-        if chg > 0.15 and doi > 0:
-            buildup = "LONG BUILDUP"
-        elif chg > 0.15 and doi < 0:
-            buildup = "SHORT COVERING"
-        elif chg < -0.15 and doi > 0:
-            buildup = "SHORT BUILDUP"
-        elif chg < -0.15 and doi < 0:
-            buildup = "LONG UNWIND"
-        else:
-            buildup = "NEUTRAL"
-        enriched.append({
-            "sym": h.get("sym"), "lp": h.get("lp", 0), "chg_pct": chg,
-            "n_pts": n_contrib, "fut_doi": doi, "buildup": buildup
-        })
+        theta = (-S * pdf * sigma / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * norm_cdf(-d2)) / 365.0
+    gamma = pdf / (S * sigma * math.sqrt(T))
+    vega = (S * pdf * math.sqrt(T)) / 100.0
     return {
-        "stocks": enriched,
-        "nifty_pts": round(nifty_pts, 1),
-        "bn_pts": round(bn_pts, 1),
-        "breadth": f"{adv}/{len(hws)} Green"
+        "delta": round(delta, 2),
+        "gamma": round(gamma, 5),
+        "theta": round(theta, 2),
+        "vega": round(vega, 2)
     }
 
-def compute_max_pain(strikes_dict):
-    all_k = sorted(strikes_dict.keys())
-    if not all_k:
-        return 0
-    min_pain = float("inf")
-    mp_strike = all_k[len(all_k)//2]
-    for exp_p in all_k:
-        pain = 0
-        for k in all_k:
-            ce_oi = (strikes_dict[k].get("CE") or {}).get("oi", 0)
-            pe_oi = (strikes_dict[k].get("PE") or {}).get("oi", 0)
-            if exp_p > k:
-                pain += (exp_p - k) * ce_oi
-            elif exp_p < k:
-                pain += (k - exp_p) * pe_oi
-        if pain < min_pain:
-            min_pain = pain
-            mp_strike = exp_p
-    return mp_strike
-
-def compute_master_analytics(ticks, chains, micro, hws):
-    out = {}
-    now_ts = time.time()
-    tps = int((micro or {}).get("ticks_per_sec", 0))
-    nifty_sp = float((ticks.get("NIFTY_SPOT") or {}).get("lp", 0) or 0)
-    bn_sp = float((ticks.get("BN_SPOT") or {}).get("lp", 0) or 0)
-    hw_summary = analyze_heavyweights(hws, nifty_sp, bn_sp)
-
-    for tag, step in [("NIFTY", 50), ("BN", 100), ("SX", 100)]:
-        sp = float((ticks.get(f"{tag}_SPOT") or {}).get("lp", 0) or 0)
-        f1 = ticks.get(f"{tag}_F1") or {}
-        f2 = ticks.get(f"{tag}_F2") or {}
-        chain = chains.get(tag, [])
-        if not sp or not chain:
-            continue
-
-        atm = int(round(sp / step) * step)
-        strikes = {}
-        tot_ce_oi, tot_pe_oi = 0, 0
-        broad_ce_oi, broad_pe_oi = 0, 0
-        max_ce_oi, res_strike = -1, atm
-        max_pe_oi, sup_strike = -1, atm
-        broad_max_ce, broad_res = -1, atm
-        broad_max_pe, broad_sup = -1, atm
-        net_gex = 0.0
-        ce_tbq, ce_tsq, pe_tbq, pe_tsq = 0, 0, 0, 0
-        alerts = []
-        iv_map = {}
-        otm_pe_ivs, otm_ce_ivs = [], []
-        gex_by_strike = {}
-
-        for row in chain:
-            st = int(row["strike"])
-            optt = row["optt"]
-            lp = float(row.get("lp", 0) or 0)
-            oi = int(row.get("oi", 0) or 0)
-            poi = int(row.get("poi", oi) or oi)
-            doi = oi - poi
-            iv, delta, gamma, theta = solve_greeks(sp, st, lp, optt)
-            row["iv"] = iv
-            row["delta"] = delta
-            row["gamma"] = gamma
-            row["theta"] = theta
-            row["doi"] = doi
-            iv_map[f"{st}_{optt}"] = iv
-
-            strike_gex = (gamma * oi * sp * sp * 0.01) / 1e7
-            signed_gex = strike_gex if optt == "CE" else -strike_gex
-            net_gex += signed_gex
-            gex_by_strike[st] = gex_by_strike.get(st, 0.0) + signed_gex
-
-            if doi > 0 and lp > 0:
-                quad = "LONG BUILD" if (optt == "CE" and sp >= st) or (optt == "PE" and sp <= st) else "SHORT BUILD"
-            elif doi < 0:
-                quad = "SHORT COVER"
-            else:
-                quad = "NEUTRAL"
-            row["quad"] = quad
-
-            strikes.setdefault(st, {"strike": st, "CE": {}, "PE": {}})
-            strikes[st][optt] = row
-
-            dist_steps = abs(st - atm) // step
-            if optt == "CE":
-                broad_ce_oi += oi
-                if oi > broad_max_ce: broad_max_ce, broad_res = oi, st
-                if st > atm and dist_steps <= 6: otm_ce_ivs.append(iv)
-            else:
-                broad_pe_oi += oi
-                if oi > broad_max_pe: broad_max_pe, broad_sup = oi, st
-                if st < atm and dist_steps <= 6: otm_pe_ivs.append(iv)
-
-            if dist_steps <= 5:
-                if optt == "CE":
-                    tot_ce_oi += oi
-                    ce_tbq += int(row.get("tbq", 0))
-                    ce_tsq += int(row.get("tsq", 0))
-                    if oi > max_ce_oi: max_ce_oi, res_strike = oi, st
-                else:
-                    tot_pe_oi += oi
-                    pe_tbq += int(row.get("tbq", 0))
-                    pe_tsq += int(row.get("tsq", 0))
-                    if oi > max_pe_oi: max_pe_oi, sup_strike = oi, st
-            else:
-                is_itm = (optt == "CE" and st < atm) or (optt == "PE" and st > atm)
-                zone = "DEEP ITM" if is_itm else "FAR OTM"
-                if row["v"] > 2500000 or iv > 32.0:
-                    alerts.append(f"{zone} {st} {optt} (Vol: {row['v']:,} | IV: {iv}% | Δ: {delta})")
-
-        max_pain = compute_max_pain(strikes)
-        gamma_flip = min(gex_by_strike.keys(), key=lambda k: abs(gex_by_strike[k])) if gex_by_strike else atm
-
-        hist = ROLLING_HISTORY[tag]
-        hist.append({"ts": now_ts, "atm_iv": iv_map.get(f"{atm}_CE", 14.0), "sp": sp})
-        past_3m = next((x for x in hist if now_ts - x["ts"] >= 150), hist[0])
-        iv_vel_3m = round(iv_map.get(f"{atm}_CE", 14.0) - past_3m["atm_iv"], 2)
-
-        ce_imb = round(ce_tbq / max(1, ce_tsq), 2)
-        pe_imb = round(pe_tbq / max(1, pe_tsq), 2)
-        ob_signal = f"CE {ce_imb}x | PE {pe_imb}x"
-
-        net_gex_cr = round(net_gex, 1)
-        gex_regime = "POSITIVE GEX (Pinning)" if net_gex_cr >= 0 else "NEGATIVE GEX (Squeeze Risk)"
-
-        atm_row = strikes.get(atm, {})
-        atm_ce_obj = atm_row.get("CE") or {}
-        atm_pe_obj = atm_row.get("PE") or {}
-        atm_ce = atm_ce_obj.get("lp", 0)
-        atm_pe = atm_pe_obj.get("lp", 0)
-        atm_iv = round((atm_ce_obj.get("iv", 14.0) + atm_pe_obj.get("iv", 14.0)) / 2.0, 1)
-        straddle_prem = round(atm_ce + atm_pe, 2)
-        synth_fut = round(atm + atm_ce - atm_pe, 2) if (atm_ce and atm_pe) else sp
-        synth_diff = round(synth_fut - sp, 2)
-        pcr = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 0
-        broad_pcr = round(broad_pe_oi / broad_ce_oi, 2) if broad_ce_oi > 0 else 0
-
-        hw_pts = hw_summary["bn_pts"] if tag == "BN" else hw_summary["nifty_pts"]
-        is_spike = (tps > 120 or abs(iv_vel_3m) >= 1.2 or ce_imb > 2.2 or pe_imb > 2.2 or net_gex_cr < -150)
-
-        if is_spike:
-            spike_shield = f"🚨 GAMMA SHIELD ACTIVE! (TPS: {tps}/s | 3m ΔIV: {iv_vel_3m:+.2f}% | {ob_signal}) — EXIT / HEDGE NAKED SHORTS!"
-            shield_level = "DANGER"
-            if (ce_imb > 1.8 or hw_pts > 35 or synth_diff > 5):
-                pro_action = "🔥 OPTION BUYING / CALL BREAKOUT (Momentum CE Scalp — Avoid Shorting Calls)"
-                action_cls = "buy"
-            elif (pe_imb > 1.8 or hw_pts < -35 or synth_diff < -5):
-                pro_action = "🔥 OPTION BUYING / PUT BREAKDOWN (Momentum PE Scalp — Avoid Shorting Puts)"
-                action_cls = "buy"
-            else:
-                pro_action = "⚠️ VOLATILITY SPIKE — WAIT FOR IV COOL-OFF (No Naked Selling)"
-                action_cls = "warn"
+def implied_vol(price, S, K, T, r, optt):
+    if price <= 0.5 or S <= 0 or K <= 0 or T <= 0:
+        return 0.14
+    intrinsic = max(0.0, (S - K) if optt == "CE" else (K - S))
+    if price <= intrinsic + 0.2:
+        return 0.11
+    low, high = 0.05, 1.50
+    for _ in range(22):
+        mid = 0.5 * (low + high)
+        d1 = (math.log(S / K) + (r + 0.5 * mid * mid) * T) / (mid * math.sqrt(T))
+        d2 = d1 - mid * math.sqrt(T)
+        if optt == "CE":
+            val = S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
         else:
-            spike_shield = f"🛡️ GAMMA SHIELD GREEN — Positive GEX ({net_gex_cr} Cr) & Stable IV ({iv_vel_3m:+.2f}%)"
-            shield_level = "SAFE"
-            if hw_pts > 40 and pcr >= 1.05:
-                pro_action = "🟢 BULLISH CREDIT SPREAD / SELL OTM PUTS (Heavyweights + Put Writing Support)"
-                action_cls = "sell"
-            elif hw_pts < -40 and pcr <= 0.85:
-                pro_action = "🟢 BEARISH CREDIT SPREAD / SELL OTM CALLS (Heavyweight Drag + Call Writing)"
-                action_cls = "sell"
-            else:
-                pro_action = f"🟢 OPTION SELLING ZONE — SHORT STRANGLE / IRON CONDOR (Range {sup_strike}–{res_strike})"
-                action_cls = "sell"
-
-        f1_lp = float(f1.get("lp", 0) or 0)
-        f2_lp = float(f2.get("lp", 0) or 0)
-        cal_spread = round(f2_lp - f1_lp, 2) if (f1_lp and f2_lp) else 0
-        ann_carry = round((cal_spread / f1_lp) * 12 * 100, 2) if f1_lp else 0
-        avg_pe_iv = sum(otm_pe_ivs)/len(otm_pe_ivs) if otm_pe_ivs else atm_iv
-        avg_ce_iv = sum(otm_ce_ivs)/len(otm_ce_ivs) if otm_ce_ivs else atm_iv
-        iv_skew = round(avg_pe_iv - avg_ce_iv, 2)
-        wing_iv = round((avg_pe_iv + avg_ce_iv) / 2.0, 1)
-        term_structure = "CONTANGO (Normal Carry — Safe Positional Selling)" if (cal_spread > 0 and atm_iv <= wing_iv + 2.5) else "BACKWARDATION / EVENT SPIKE RISK (Hedge Positional Shorts!)"
-        swing_10d_move = round(sp * (atm_iv / 100.0) * math.sqrt(10 / 365.0), 0)
-
-        if "BACKWARDATION" in term_structure or iv_skew > 2.8:
-            pos_action = "⚠️ POSITIONAL DEFENSIVE: Buy Protective Wings / Reduce Naked Short Lots"
-        elif broad_pcr >= 1.15 and ann_carry >= 5.5:
-            pos_action = "🟢 POSITIONAL BULLISH: Sell OTM Put Spreads (3–15 Days Carry)"
-        elif broad_pcr <= 0.82:
-            pos_action = "🟢 POSITIONAL BEARISH: Sell OTM Call Spreads (3–15 Days Carry)"
+            val = K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
+        if val > price:
+            high = mid
         else:
-            pos_action = f"🟢 POSITIONAL IRON CONDOR: Short {broad_sup} PE & {broad_res} CE (Theta Harvest)"
+            low = mid
+    return round(0.5 * (low + high), 4)
 
-        all_strikes = sorted(strikes.keys())
-        rows_12 = [strikes[k] for k in all_strikes]
-        rows_5 = [strikes[k] for k in all_strikes if abs(k - atm) <= 5 * step]
-        peak_oi_12 = max([max((strikes[k].get("CE") or {}).get("oi", 0), (strikes[k].get("PE") or {}).get("oi", 0)) for k in all_strikes] + [1])
-        peak_oi_5 = max([max((strikes[k].get("CE") or {}).get("oi", 0), (strikes[k].get("PE") or {}).get("oi", 0)) for k in all_strikes if abs(k - atm) <= 5 * step] + [1])
+def enrich_chain(raw_rows, spot, lot_size=75, dte_days=4.0):
+    if not raw_rows or spot <= 0:
+        return {"rows": [], "net_gex_cr": 0.0, "max_pain": 0, "gamma_flip": 0, "pcr": 1.0, "atm_iv": 13.5, "sweep_bias": 0.0}
+    T = max(dte_days, 0.25) / 365.0
+    r = 0.065
+    by_strike = {}
+    tot_ce_oi, tot_pe_oi = 0, 0
+    tot_tbq, tot_tsq = 0, 0
 
-        out[tag] = {
-            "atm": atm, "synth_fut": synth_fut, "synth_diff": synth_diff,
-            "pcr": pcr, "res_strike": res_strike, "max_ce_oi": max_ce_oi,
-            "sup_strike": sup_strike, "max_pe_oi": max_pe_oi,
-            "max_pain": max_pain, "gamma_flip": gamma_flip,
-            "straddle": straddle_prem, "net_gex": net_gex_cr, "gex_regime": gex_regime,
-            "tps": tps, "iv_vel_3m": iv_vel_3m, "ob_signal": ob_signal,
-            "spike_shield": spike_shield, "shield_level": shield_level,
-            "pro_action": pro_action, "action_cls": action_cls,
-            "peak_oi_5": peak_oi_5, "peak_oi_12": peak_oi_12,
-            "alerts": alerts[:3], "rows_5": rows_5, "rows_12": rows_12,
-            "positional": {
-                "cal_spread": cal_spread, "ann_carry": ann_carry, "atm_iv": atm_iv,
-                "iv_skew": iv_skew, "broad_pcr": broad_pcr, "term_structure": term_structure,
-                "broad_sup": broad_sup, "broad_res": broad_res, "max_pain": max_pain,
-                "swing_move": int(swing_10d_move),
-                "swing_low": int(sp - swing_10d_move), "swing_high": int(sp + swing_10d_move),
-                "pos_action": pos_action
-            }
+    for item in raw_rows:
+        k = int(item.get("strike", 0))
+        optt = item.get("optt", "CE")
+        lp = float(item.get("lp", 0) or 0)
+        oi = int(item.get("oi", 0) or 0)
+        poi = int(item.get("poi", oi) or 0)
+        v = int(item.get("v", 0) or 0)
+        tbq = int(item.get("tbq", 0) or 0)
+        tsq = int(item.get("tsq", 0) or 0)
+
+        iv = implied_vol(lp, spot, k, T, r, optt)
+        gk = bs_greeks(spot, k, T, r, iv, optt)
+        doi = oi - poi
+
+        if optt == "CE":
+            tot_ce_oi += oi
+            tot_tbq += tbq
+            tot_tsq += tsq
+        else:
+            tot_pe_oi += oi
+            tot_tbq += tsq
+            tot_tsq += tbq
+
+        if k not in by_strike:
+            by_strike[k] = {"strike": k}
+        by_strike[k][optt] = {
+            "lp": lp, "oi": oi, "doi": doi, "v": v,
+            "tbq": tbq, "tsq": tsq,
+            "iv": round(iv * 100, 1),
+            "delta": gk["delta"], "gamma": gk["gamma"],
+            "theta": gk["theta"], "vega": gk["vega"]
         }
-    out["heavyweights"] = hw_summary
-    return out
 
-HTML_DASHBOARD = """<!DOCTYPE html>
-<html>
+    strikes = sorted(by_strike.keys())
+    net_gex = 0.0
+    atm_strike = min(strikes, key=lambda x: abs(x - spot)) if strikes else spot
+    atm_iv = 13.5
+
+    rows_out = []
+    for k in strikes:
+        ce = by_strike[k].get("CE", {"lp": 0, "oi": 0, "doi": 0, "v": 0, "iv": 13.5, "delta": 0, "gamma": 0, "theta": 0, "vega": 0})
+        pe = by_strike[k].get("PE", {"lp": 0, "oi": 0, "doi": 0, "v": 0, "iv": 13.5, "delta": 0, "gamma": 0, "theta": 0, "vega": 0})
+        ce_gex = ce["gamma"] * ce["oi"] * lot_size * (spot ** 2) * 0.01
+        pe_gex = -pe["gamma"] * pe["oi"] * lot_size * (spot ** 2) * 0.01
+        net_gex += (ce_gex + pe_gex)
+
+        if k == atm_strike:
+            atm_iv = round((ce["iv"] + pe["iv"]) / 2.0, 1)
+
+        ce_act = "SHORT COVERING" if ce["doi"] < -25000 else ("CALL WRITING" if ce["doi"] > 25000 else "NEUTRAL")
+        pe_act = "PUT WRITING" if pe["doi"] > 25000 else ("LONG UNWINDING" if pe["doi"] < -25000 else "NEUTRAL")
+
+        rows_out.append({
+            "strike": k,
+            "is_atm": (k == atm_strike),
+            "ce": ce, "pe": pe,
+            "ce_act": ce_act, "pe_act": pe_act
+        })
+
+    # Max Pain calculation
+    max_pain = atm_strike
+    min_loss = float("inf")
+    for test_k in strikes:
+        loss = 0
+        for row in rows_out:
+            rk = row["strike"]
+            if test_k > rk:
+                loss += (test_k - rk) * row["ce"]["oi"]
+            elif test_k < rk:
+                loss += (rk - test_k) * row["pe"]["oi"]
+        if loss < min_loss:
+            min_loss = loss
+            max_pain = test_k
+
+    # Gamma Flip estimate (strike where PE OI wall transitions to CE OI wall)
+    gamma_flip = atm_strike
+    for row in rows_out:
+        if row["ce"]["oi"] > row["pe"]["oi"] and row["strike"] >= spot * 0.985:
+            gamma_flip = row["strike"]
+            break
+
+    pcr = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 1.0
+    sweep_bias = round(((tot_tbq - tot_tsq) / max(tot_tbq + tot_tsq, 1)) * 100, 1)
+
+    return {
+        "rows": rows_out,
+        "net_gex_cr": round(net_gex / 1e7, 1),
+        "max_pain": max_pain,
+        "gamma_flip": gamma_flip,
+        "pcr": pcr,
+        "atm_iv": atm_iv,
+        "sweep_bias": sweep_bias
+    }
+
+def compute_decision_engine(state):
+    ticks = state.get("ticks", {})
+    hws = state.get("heavyweights", [])
+    n_spot = float((ticks.get("NIFTY_SPOT") or {}).get("lp", 0) or 0)
+    n_f1 = float((ticks.get("NIFTY_F1") or {}).get("lp", n_spot) or n_spot)
+    n_f2 = float((ticks.get("NIFTY_F2") or {}).get("lp", n_f1) or n_f1)
+    sx_spot = float((ticks.get("SX_SPOT") or {}).get("lp", 0) or 0)
+
+    n_chain = enrich_chain(state.get("chains", {}).get("NIFTY", []), n_spot, lot_size=75, dte_days=3.5)
+    bn_spot = float((ticks.get("BN_SPOT") or {}).get("lp", 0) or 0)
+    bn_chain = enrich_chain(state.get("chains", {}).get("BN", []), bn_spot, lot_size=30, dte_days=3.5)
+    sx_chain = enrich_chain(state.get("chains", {}).get("SX", []), sx_spot, lot_size=20, dte_days=3.5)
+
+    # Heavyweight Attribution
+    green_cnt = 0
+    nifty_pts = 0.0
+    sensex_pts = 0.0
+    enriched_hws = []
+    for h in hws:
+        chg = float(h.get("chg_pct", 0) or 0)
+        wt_n = float(h.get("wt", 0) or 0)
+        wt_sx = float(h.get("wt_sx", wt_n * 1.15) or 0)
+        f_doi = int(h.get("fut_doi", 0) or 0)
+        if chg > 0:
+            green_cnt += 1
+        n_imp = round((n_spot * (wt_n / 100.0) * (chg / 100.0)), 1) if n_spot > 0 else 0.0
+        sx_imp = round((sx_spot * (wt_sx / 100.0) * (chg / 100.0)), 1) if sx_spot > 0 else 0.0
+        nifty_pts += n_imp
+        sensex_pts += sx_imp
+
+        if chg >= 0 and f_doi >= 0:
+            buildup = "LONG BUILDUP"
+        elif chg >= 0 and f_doi < 0:
+            buildup = "SHORT COVERING"
+        elif chg < 0 and f_doi >= 0:
+            buildup = "SHORT BUILDUP"
+        else:
+            buildup = "LONG UNWINDING"
+
+        stk_lp = float(h.get("lp", 0) or 0)
+        stk_iv = float(h.get("atm_iv", 22.5) or 22.5)
+        stk_gk = bs_greeks(stk_lp, stk_lp, 12.0 / 365.0, 0.065, stk_iv / 100.0, "CE")
+        if chg > 0.8 and f_doi > 0:
+            stk_sig = "BUY CALL / BULL SPREAD"
+        elif chg < -0.8 and f_doi > 0:
+            stk_sig = "BUY PUT / BEAR SPREAD"
+        elif abs(chg) < 0.45:
+            stk_sig = "SELL STRANGLE (THETA)"
+        else:
+            stk_sig = "SELL OTM PUT" if chg > 0 else "SELL OTM CE"
+
+        item = dict(h)
+        item.update({
+            "nifty_pts": n_imp,
+            "sensex_pts": sx_imp,
+            "buildup": buildup,
+            "atm_iv": stk_iv,
+            "atm_delta": stk_gk["delta"],
+            "atm_gamma": stk_gk["gamma"],
+            "stk_signal": stk_sig
+        })
+        enriched_hws.append(item)
+
+    enriched_hws.sort(key=lambda x: abs(x["nifty_pts"]), reverse=True)
+    top_movers = [f"{x['sym']} ({'+' if x['nifty_pts']>=0 else ''}{x['nifty_pts']}p)" for x in enriched_hws[:3]]
+
+    # Regime Judge: Option Buying vs Option Selling
+    gex = n_chain["net_gex_cr"]
+    pcr = n_chain["pcr"]
+    iv = n_chain["atm_iv"]
+    sweep = n_chain["sweep_bias"]
+    total_hws = max(len(enriched_hws), 1)
+    breadth_ratio = green_cnt / total_hws
+
+    if gex < -150 and (breadth_ratio >= 0.70 or breadth_ratio <= 0.30) and iv >= 14.5:
+        regime = "OPTION BUYING REGIME (GAMMA EXPANSION)"
+        regime_color = "#ff9f1c"
+        if breadth_ratio >= 0.70 and pcr >= 1.05:
+            action = "STRONG BUY CE — GAMMA BREAKOUT"
+            sub = f"Negative GEX ({gex} Cr) + {green_cnt}/{total_hws} Heavyweights Long + Order Sweep {sweep}% | Avoid Shorting Calls"
+            banner_bg = "linear-gradient(90deg, #064e3b, #047857)"
+            border_c = "#10b981"
+        elif breadth_ratio <= 0.30 and pcr <= 0.90:
+            action = "STRONG BUY PE — GAMMA CRASH VELOCITY"
+            sub = f"Negative GEX ({gex} Cr) + Heavyweight Selloff ({green_cnt}/{total_hws} Green) | Momentum Put Buying Active"
+            banner_bg = "linear-gradient(90deg, #7f1d1d, #b91c1c)"
+            border_c = "#ef4444"
+        else:
+            action = "EXIT IMMEDIATELY ON REVERSAL / SCALP ONLY"
+            sub = "High Gamma Volatility Detected — Tighten Trailing SL to Cost"
+            banner_bg = "linear-gradient(90deg, #78350f, #b45309)"
+            border_c = "#f59e0b"
+    else:
+        regime = "OPTION SELLING REGIME (POSITIVE GEX THETA HARVEST)"
+        regime_color = "#38bdf8"
+        if breadth_ratio >= 0.65 and pcr >= 1.15:
+            action = "SELL OTM PE / BULL PUT CREDIT SPREAD"
+            sub = f"Positive GEX (+{gex} Cr) Dealer Support + Put Writing Wall (PCR {pcr}) | High Probability Theta Decay"
+            banner_bg = "linear-gradient(90deg, #065f46, #0f766e)"
+            border_c = "#34d399"
+        elif breadth_ratio <= 0.35 and pcr <= 0.85:
+            action = "SELL OTM CE / BEAR CALL CREDIT SPREAD"
+            sub = f"Heavy Call Writing Resistance (PCR {pcr}) + Weak Heavyweight Breadth ({green_cnt}/{total_hws} Green)"
+            banner_bg = "linear-gradient(90deg, #881337, #9f1239)"
+            border_c = "#fb7185"
+        else:
+            action = "SELL IRON CONDOR / STRANGLE (RANGE PINNED) — AVOID NAKED BUYING"
+            sub = f"Price Pinned Near Max Pain {n_chain['max_pain']} | Positive GEX (+{gex} Cr) Absorbing Moves"
+            banner_bg = "linear-gradient(90deg, #1e3a8a, #1d4ed8)"
+            border_c = "#60a5fa"
+
+    # Exit Alert Check
+    exit_alert = None
+    if sweep < -18 and breadth_ratio < 0.45:
+        exit_alert = "EXIT CE IMMEDIATELY — Institutional Ask Sweep & Heavyweight Reversal Detected!"
+    elif sweep > 18 and breadth_ratio > 0.55:
+        exit_alert = "EXIT PE IMMEDIATELY — Aggressive Bid Sweep & Heavyweight Short Covering!"
+
+    # Positional 3-15 Day Assessment
+    basis_f1 = round(n_f1 - n_spot, 1)
+    roll_spread = round(n_f2 - n_f1, 1)
+    if iv < 13.0 and breadth_ratio >= 0.60:
+        pos_verdict = "POSITIONAL DEBIT CALL SPREAD (LOW IV ENTRY)"
+        pos_reason = f"ATM IV {iv}% is cheap (<13%) + F1-F2 Rollover Spread +{roll_spread} pts shows institutional long carry."
+    elif iv >= 14.5:
+        pos_verdict = "POSITIONAL CREDIT SPREAD / IRON CONDOR (HIGH IV THETA SELL)"
+        pos_reason = f"Elevated IV ({iv}%) offers rich 3–15 day theta decay; anchor short strikes outside Max Pain {n_chain['max_pain']}."
+    else:
+        pos_verdict = "POSITIONAL BULL PUT / RATIO SPREAD"
+        pos_reason = f"F1 Basis +{basis_f1} pts | Net Nifty Impact {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)} pts | Sensex {'+' if sensex_pts>=0 else ''}{round(sensex_pts,1)} pts."
+
+    # Enrich Stock Option Chains
+    raw_stk_chains = state.get("stock_chains", {})
+    enriched_stk_chains = {}
+    hw_map = {x["sym"]: x for x in enriched_hws}
+    for sym, srows in raw_stk_chains.items():
+        sp = float((hw_map.get(sym) or {}).get("lp", 0) or 0)
+        enriched_stk_chains[sym] = enrich_chain(srows, sp, lot_size=500, dte_days=12.0)
+
+    return {
+        "micro": state.get("micro", {}),
+        "ticks": ticks,
+        "decision": {
+            "regime": regime,
+            "regime_color": regime_color,
+            "action": action,
+            "sub": sub,
+            "banner_bg": banner_bg,
+            "border_c": border_c,
+            "exit_alert": exit_alert,
+            "green_cnt": green_cnt,
+            "total_hws": total_hws,
+            "nifty_pts": round(nifty_pts, 1),
+            "sensex_pts": round(sensex_pts, 1),
+            "top_movers": top_movers,
+            "pos_verdict": pos_verdict,
+            "pos_reason": pos_reason,
+            "basis_f1": basis_f1,
+            "roll_spread": roll_spread
+        },
+        "chains": {
+            "NIFTY": n_chain,
+            "BN": bn_chain,
+            "SX": sx_chain
+        },
+        "heavyweights": enriched_hws,
+        "stock_chains": enriched_stk_chains
+    }
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
 <head>
-<title>GammaShield — Institutional Options & Volatility Terminal</title>
+<meta charset="UTF-8">
+<title>GammaShield v2.0 — Institutional Options, Futures & 30-Stock Terminal</title>
 <style>
-  body { font-family: 'Segoe UI', sans-serif; background: #090d16; color: #f1f5f9; margin: 0; padding: 18px; }
-  .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 12px; }
-  .tabs { display: flex; gap: 10px; margin: 14px 0; }
-  .tab-btn { background: #1e293b; color: #94a3b8; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 13px; }
-  .tab-btn.active { background: #0284c7; color: #fff; }
-  .shield-banner { padding: 10px 15px; border-radius: 8px; margin-bottom: 10px; font-weight: bold; font-size: 13px; border: 1px solid #065f46; background: #064e3b; color: #6ee7b7; }
-  .shield-banner.danger { border-color: #dc2626; background: #450a0a; color: #fca5a5; }
-  .decision-banner { padding: 12px 16px; border-radius: 8px; margin-bottom: 14px; font-weight: bold; font-size: 15px; border-left: 5px solid #22c55e; background: #0f172a; color: #4ade80; }
-  .decision-banner.buy { border-left-color: #f97316; color: #fdba74; background: #1c1917; }
-  .decision-banner.warn { border-left-color: #eab308; color: #fde047; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; }
-  .card { background: #131c2e; padding: 15px; border-radius: 12px; border: 1px solid #1e293b; }
-  .spot-price { font-size: 26px; font-weight: bold; color: #38bdf8; margin: 4px 0 8px 0; }
-  .fut-row { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 7px 11px; border-radius: 8px; margin-top: 6px; border-left: 3px solid #38bdf8; }
-  .fut-row.m2 { border-left-color: #a855f7; }
-  .prem { font-size: 11px; padding: 2px 6px; border-radius: 5px; background: #1e293b; color: #34d399; font-weight: bold; }
-  .badge { background: #064e3b; color: #34d399; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-  .meta { font-size: 11px; color: #94a3b8; margin-top: 2px; }
-  .hw-box { background: #131c2e; padding: 15px; border-radius: 12px; border: 1px solid #1e293b; margin-top: 15px; }
-  .hw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 9px; margin-top: 10px; }
-  .hw-tile { background: #0f172a; border: 1px solid #1e293b; padding: 9px 11px; border-radius: 8px; }
-  .oc-box { background: #131c2e; padding: 15px; border-radius: 12px; border: 1px solid #1e293b; margin-top: 15px; }
-  .oc-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
-  .idx-btn { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }
-  .idx-btn.active { background: #0ea5e9; color: #090d16; border-color: #0ea5e9; }
-  .depth-btn { background: #1e293b; color: #fbbf24; border: 1px solid #475569; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }
-  .depth-btn.active { background: #fbbf24; color: #090d16; }
-  .cockpit-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: 10px; margin-bottom: 12px; }
-  .cp-card { background: #0f172a; border: 1px solid #334155; padding: 10px 13px; border-radius: 8px; }
-  .cp-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; }
-  .cp-val { font-size: 14px; font-weight: bold; margin-top: 3px; }
-  .alert-bar { background: #2e1065; border: 1px solid #7c3aed; color: #e9d5ff; padding: 9px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 12px; display: none; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: right; }
-  th { background: #0f172a; color: #94a3b8; padding: 8px; border-bottom: 1px solid #1e293b; }
-  td { padding: 6px 8px; border-bottom: 1px solid #1e293b; }
-  .atm-row { background: #1e293b !important; font-weight: bold; }
-  .strike-col { text-align: center; font-weight: bold; color: #fbbf24; background: #0f172a; }
-  .oi-cell { min-width: 110px; }
-  .oi-bar-ce { height: 4px; background: #ef4444; border-radius: 2px; margin-top: 3px; margin-left: auto; }
-  .oi-bar-pe { height: 4px; background: #22c55e; border-radius: 2px; margin-top: 3px; margin-right: auto; }
-  .tag-quad { font-size: 10px; padding: 2px 5px; border-radius: 4px; background: #1e293b; color: #38bdf8; }
-  .regime-banner { background: #0f172a; border-left: 4px solid #22c55e; padding: 10px 12px; border-radius: 6px; margin: 10px 0; font-size: 13px; font-weight: bold; color: #4ade80; }
-  .pos-row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid #1e293b; font-size: 13px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Roboto, Arial, sans-serif; }
+  body { background: #070b14; color: #e2e8f0; padding: 12px 18px; font-size: 13px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid #1e293b; padding-bottom: 8px; }
+  .brand { font-size: 18px; font-weight: 700; color: #f8fafc; letter-spacing: 0.4px; }
+  .brand span { color: #38bdf8; }
+  .status-pill { background: #064e3b; color: #34d399; border: 1px solid #10b981; padding: 4px 10px; border-radius: 4px; font-weight: 700; font-size: 11px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 10px; }
+  .tab-btn { background: #0f172a; color: #94a3b8; border: 1px solid #1e293b; padding: 7px 14px; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px; }
+  .tab-btn.active { background: #0284c7; color: #ffffff; border-color: #38bdf8; }
+  .regime-strip { display: flex; justify-content: space-between; align-items: center; background: #0f172a; border: 1px solid #1e293b; padding: 6px 12px; border-radius: 5px; margin-bottom: 8px; font-size: 12px; }
+  .action-banner { padding: 11px 15px; border-radius: 6px; margin-bottom: 10px; border-left: 5px solid #10b981; }
+  .action-title { font-size: 16px; font-weight: 800; color: #ffffff; letter-spacing: 0.3px; }
+  .action-sub { font-size: 12px; color: #e2e8f0; margin-top: 3px; }
+  .exit-flash { background: #991b1b; border: 1px solid #f87171; color: #ffffff; padding: 8px 12px; border-radius: 5px; font-weight: 800; margin-bottom: 10px; text-align: center; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.65; } 100% { opacity: 1; } }
+  .idx-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
+  .card { background: #0d1424; border: 1px solid #1e293b; border-radius: 6px; padding: 10px 12px; }
+  .idx-title { font-size: 11px; color: #94a3b8; font-weight: 700; }
+  .idx-spot { font-size: 22px; font-weight: 800; color: #38bdf8; margin: 2px 0 6px 0; }
+  .fut-row { display: flex; justify-content: space-between; background: #131c31; padding: 5px 8px; border-radius: 4px; margin-top: 4px; font-size: 11.5px; }
+  .section-hdr { display: flex; justify-content: space-between; align-items: center; margin: 10px 0 6px 0; font-weight: 700; color: #cbd5e1; font-size: 12.5px; }
+  .hw-strip { display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; margin-bottom: 10px; }
+  .hw-box { background: #0f172a; border: 1px solid #1e293b; border-radius: 5px; padding: 6px; cursor: pointer; transition: 0.15s; }
+  .hw-box:hover { border-color: #38bdf8; background: #16223b; }
+  .green { color: #34d399; } .red { color: #f87171; } .amber { color: #fbbf24; } .cyan { color: #38bdf8; }
+  .metrics-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+  .metric-box { background: #0f172a; border: 1px solid #1e293b; padding: 7px 10px; border-radius: 5px; }
+  .metric-lbl { font-size: 10.5px; color: #94a3b8; }
+  .metric-val { font-size: 13.5px; font-weight: 700; color: #f8fafc; margin-top: 2px; }
+  .idx-switch button { background: #1e293b; color: #cbd5e1; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-weight: 700; margin-left: 4px; }
+  .idx-switch button.active { background: #f59e0b; color: #000; }
+  .chain-wrap { max-height: 460px; overflow-y: auto; border: 1px solid #1e293b; border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  th { background: #111827; color: #94a3b8; padding: 7px 6px; position: sticky; top: 0; z-index: 2; border-bottom: 1px solid #334155; text-align: center; }
+  td { padding: 5px 6px; border-bottom: 1px solid #172033; text-align: center; }
+  tr.atm-row { background: #172554 !important; font-weight: 700; }
+  tr:hover { background: #131d33; }
+  .badge { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; }
+  .b-buy { background: #064e3b; color: #34d399; }
+  .b-sell { background: #7f1d1d; color: #fca5a5; }
+  .b-neu { background: #1e293b; color: #94a3b8; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
-  <div class="header">
-    <h2>🛡️ GammaShield — Institutional Options & Volatility Terminal</h2>
-    <div><span class="badge" id="ws_mode">● DIRECT ENGINE ONLINE</span> <span id="tm" style="margin-left:10px;color:#94a3b8;">--:--:--</span></div>
+
+<div class="topbar">
+  <div class="brand">&#9724; GammaShield <span>v2.0</span> — Institutional Options, Futures &amp; 30-Stock Terminal</div>
+  <div>
+    <span id="tpsBadge" style="color:#94a3b8; margin-right:10px; font-size:11.5px;">0 ticks/s</span>
+    <span id="modeBadge" class="status-pill">CONNECTING...</span>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab(1, this)">1. Intraday Pro-Desk Execution &amp; Gamma Shield</button>
+  <button class="tab-btn" onclick="switchTab(2, this)">2. Positional Swing &amp; Term-Structure (3–15 Days)</button>
+  <button class="tab-btn" onclick="switchTab(3, this)">3. All 30 Stocks Attribution, Futures &amp; Stock Options</button>
+</div>
+
+<div class="regime-strip">
+  <div><strong>REGIME JUDGE:</strong> <span id="regimeText" class="amber">ANALYZING...</span></div>
+  <div><strong>INDEX DRIVERS:</strong> <span id="topMoversText" class="cyan">Loading...</span></div>
+  <div><strong>NET IMPACT:</strong> Nifty <span id="nImpact">0</span> pts | Sensex <span id="sxImpact">0</span> pts</div>
+</div>
+
+<div id="exitBox" class="exit-flash hidden"></div>
+
+<div id="actionBanner" class="action-banner" style="background: linear-gradient(90deg, #064e3b, #047857);">
+  <div class="action-title" id="actionTitle">INITIALIZING INSTITUTIONAL DECISION ENGINE...</div>
+  <div class="action-sub" id="actionSub">Waiting for tick stream...</div>
+</div>
+
+<!-- TAB 1: INTRADAY EXECUTION & FULL 25-STRIKE OPTION CHAIN -->
+<div id="tab1">
+  <div class="idx-grid" id="idxCards"></div>
+
+  <div class="section-hdr">
+    <div>Top 10 Heavyweight Movers (Click Any Stock for Live Option Chain &amp; Greeks)</div>
+    <div id="breadthSummary" class="green">Breadth: --</div>
+  </div>
+  <div class="hw-strip" id="top10Strip"></div>
+
+  <div class="section-hdr">
+    <div>Microstructure Greeks, Net GEX, Gamma Flip &amp; Full ATM ±12 Option Chain (25 Strikes)</div>
+    <div class="idx-switch">
+      <button class="active" onclick="setActiveIdx('NIFTY', this)">NIFTY (25)</button>
+      <button onclick="setActiveIdx('BN', this)">BANKNIFTY (25)</button>
+      <button onclick="setActiveIdx('SX', this)">SENSEX (25)</button>
+    </div>
   </div>
 
-  <div class="tabs">
-    <button class="tab-btn active" onclick="showTab(1)">Intraday Pro-Desk Execution & Gamma Shield</button>
-    <button class="tab-btn" onclick="showTab(2)">Positional Swing & Term-Structure Shield (3–15 Days)</button>
+  <div class="metrics-bar" id="chainMetrics"></div>
+
+  <div class="chain-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>CALL OI (ΔOI)</th><th>ACTION</th><th>CE IV%</th><th>CE Δ / Γ</th><th>CE Θ</th><th>CALL LTP</th>
+          <th style="color:#fbbf24;">STRIKE</th>
+          <th>PUT LTP</th><th>PE Θ</th><th>PE Δ / Γ</th><th>PE IV%</th><th>ACTION</th><th>PUT OI (ΔOI)</th>
+        </tr>
+      </thead>
+      <tbody id="chainBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- TAB 2: POSITIONAL SWING & TERM-STRUCTURE SHIELD (3-15 DAYS) -->
+<div id="tab2" class="hidden">
+  <div class="card" style="margin-bottom:10px; border-left:4px solid #38bdf8;">
+    <div style="font-size:14px; font-weight:800; color:#38bdf8;" id="posVerdict">POSITIONAL REGIME VERDICT</div>
+    <div style="margin-top:4px; color:#cbd5e1;" id="posReason">Analyzing F1–F2 Rollover Spread &amp; Implied Volatility Percentile...</div>
+  </div>
+  <div class="idx-grid" id="posGrid"></div>
+</div>
+
+<!-- TAB 3: ALL 30 STOCKS ATTRIBUTION, FUTURES & INTERACTIVE STOCK OPTION CHAIN -->
+<div id="tab3" class="hidden">
+  <div class="section-hdr">
+    <div>All 30 Sensex + Nifty Heavyweights — Index Point Attribution, Futures Buildup &amp; Stock Greeks (Click Any Row for Stock Option Chain)</div>
+    <div class="cyan">Click a Stock Row Below &#8595;</div>
+  </div>
+  <div class="chain-wrap" style="max-height:320px; margin-bottom:12px;">
+    <table>
+      <thead>
+        <tr>
+          <th>STOCK</th><th>LTP</th><th>CHG %</th><th>NIFTY PTS</th><th>SENSEX PTS</th>
+          <th>FUTURES BUILDUP</th><th>ATM IV%</th><th>ATM Δ / Γ</th><th>INSTITUTIONAL OPTION SIGNAL</th>
+        </tr>
+      </thead>
+      <tbody id="all30Body"></tbody>
+    </table>
   </div>
 
-  <div id="tab1">
-    <div class="shield-banner" id="shield_box">🛡️ GAMMA SHIELD INITIALIZING...</div>
-    <div class="decision-banner" id="decision_box">🎯 PRO-DESK SIGNAL LOADING...</div>
-
-    <div class="grid">
-      <div class="card">
-        <div style="color:#94a3b8;font-size:12px;">NIFTY 50 (NSE)</div>
-        <div class="spot-price" id="n_sp">--</div>
-        <div class="fut-row">
-          <div><strong id="n_f1_name">Current Fut</strong><div class="meta">OI: <span id="n_f1_oi">--</span> | Vol: <span id="n_f1_v">--</span></div></div>
-          <div style="text-align:right;"><strong id="n_f1_lp" style="font-size:15px;">--</strong><div><span class="prem" id="n_f1_prem">Basis: --</span></div></div>
-        </div>
-        <div class="fut-row m2">
-          <div><strong id="n_f2_name">Next Month Fut</strong><div class="meta">OI: <span id="n_f2_oi">--</span> | Vol: <span id="n_f2_v">--</span></div></div>
-          <div style="text-align:right;"><strong id="n_f2_lp" style="font-size:15px;">--</strong><div><span class="prem" id="n_f2_prem">Basis: --</span></div></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div style="color:#94a3b8;font-size:12px;">BANK NIFTY (NSE)</div>
-        <div class="spot-price" id="bn_sp">--</div>
-        <div class="fut-row">
-          <div><strong id="bn_f1_name">Current Fut</strong><div class="meta">OI: <span id="bn_f1_oi">--</span> | Vol: <span id="bn_f1_v">--</span></div></div>
-          <div style="text-align:right;"><strong id="bn_f1_lp" style="font-size:15px;">--</strong><div><span class="prem" id="bn_f1_prem">Basis: --</span></div></div>
-        </div>
-        <div class="fut-row m2">
-          <div><strong id="bn_f2_name">Next Month Fut</strong><div class="meta">OI: <span id="bn_f2_oi">--</span> | Vol: <span id="bn_f2_v">--</span></div></div>
-          <div style="text-align:right;"><strong id="bn_f2_lp" style="font-size:15px;">--</strong><div><span class="prem" id="bn_f2_prem">Basis: --</span></div></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div style="color:#94a3b8;font-size:12px;">SENSEX (BSE)</div>
-        <div class="spot-price" id="sx_sp" style="color:#fbbf24;">--</div>
-        <div class="fut-row">
-          <div><strong id="sx_f1_name">Current Fut</strong><div class="meta">OI: <span id="sx_f1_oi">--</span> | Vol: <span id="sx_f1_v">--</span></div></div>
-          <div style="text-align:right;"><strong id="sx_f1_lp" style="font-size:15px;">--</strong><div><span class="prem" id="sx_f1_prem">Basis: --</span></div></div>
-        </div>
-        <div class="fut-row m2">
-          <div><strong id="sx_f2_name">Next Month Fut</strong><div class="meta">OI: <span id="sx_f2_oi">--</span> | Vol: <span id="sx_f2_v">--</span></div></div>
-          <div style="text-align:right;"><strong id="sx_f2_lp" style="font-size:15px;">--</strong><div><span class="prem" id="sx_f2_prem">Basis: --</span></div></div>
-        </div>
-      </div>
+  <div class="card" id="stockChainPanel">
+    <div class="section-hdr" style="margin-top:0;">
+      <div id="stkChainTitle" style="color:#fbbf24; font-size:14px;">Select Any Stock Above to Inspect Its Live Option Chain &amp; Greeks</div>
+      <div id="stkChainMeta" class="cyan"></div>
     </div>
-
-    <div class="hw-box">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-        <strong style="font-size:15px;">🏛️ Index Heavyweight Movers & Futures Buildup Radar</strong>
-        <div style="font-size:13px;" id="hw_summary">Breadth: -- | Nifty Impact: -- pts | BankNifty Impact: -- pts</div>
-      </div>
-      <div class="hw-grid" id="hw_grid"></div>
-    </div>
-
-    <div class="oc-box">
-      <div class="oc-header">
-        <div><strong style="font-size:15px;">🎯 Microstructure Greeks, Net GEX, Gamma Flip & Synthetic Basis</strong></div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="depth-btn active" id="dep_5" onclick="setDepth(5)">ATM ± 5</button>
-          <button class="depth-btn" id="dep_12" onclick="setDepth(12)">ATM ± 12 (Full)</button>
-          <button class="idx-btn active" id="btn_NIFTY" onclick="setIdx('NIFTY')">NIFTY 50</button>
-          <button class="idx-btn" id="btn_BN" onclick="setIdx('BN')">BANK NIFTY</button>
-          <button class="idx-btn" id="btn_SX" onclick="setIdx('SX')">SENSEX</button>
-        </div>
-      </div>
-
-      <div class="cockpit-strip">
-        <div class="cp-card">
-          <div class="cp-label">Net GEX & Gamma Flip</div>
-          <div class="cp-val" id="cp_gex" style="color:#38bdf8;">--</div>
-        </div>
-        <div class="cp-card">
-          <div class="cp-label">Sub-MS Speed, 3m ΔIV & Sweep</div>
-          <div class="cp-val" id="cp_vel" style="color:#fbbf24;">--</div>
-        </div>
-        <div class="cp-card">
-          <div class="cp-label">Max Pain & ATM Straddle</div>
-          <div class="cp-val" id="cp_mp" style="color:#4ade80;">--</div>
-        </div>
-        <div class="cp-card">
-          <div class="cp-label">Synthetic Fut & PCR</div>
-          <div class="cp-val" id="cp_syn">--</div>
-        </div>
-      </div>
-
-      <div class="alert-bar" id="smart_alert"></div>
-
+    <div class="chain-wrap" style="max-height:280px;">
       <table>
         <thead>
           <tr>
-            <th>CALL OI</th><th>ACTION</th><th>IV %</th><th>Δ / Γ</th><th>CALL LTP</th>
-            <th style="text-align:center;">STRIKE</th>
-            <th style="text-align:left;">PUT LTP</th><th>Δ / Γ</th><th>IV %</th><th>ACTION</th><th style="text-align:left;">PUT OI</th>
+            <th>CALL OI</th><th>CE IV%</th><th>CE Δ / Γ</th><th>CE Θ</th><th>CALL LTP</th>
+            <th style="color:#fbbf24;">STRIKE</th>
+            <th>PUT LTP</th><th>PE Θ</th><th>PE Δ / Γ</th><th>PE IV%</th><th>PUT OI</th>
           </tr>
         </thead>
-        <tbody id="oc_body"></tbody>
+        <tbody id="stkChainBody"></tbody>
       </table>
     </div>
   </div>
-
-  <div id="tab2" style="display:none;">
-    <div class="grid">
-      <div class="card" id="pos_NIFTY"></div>
-      <div class="card" id="pos_BN"></div>
-      <div class="card" id="pos_SX"></div>
-    </div>
-  </div>
+</div>
 
 <script>
-let selectedIdx = "NIFTY";
-let chainDepth = 5;
-let latestData = {};
+let STATE = null;
+let ACTIVE_IDX = 'NIFTY';
+let SELECTED_STOCK = 'HDFCBANK';
 
-function showTab(n) {
-  document.getElementById('tab1').style.display = n===1 ? 'block' : 'none';
-  document.getElementById('tab2').style.display = n===2 ? 'block' : 'none';
-  document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', i+1===n));
-}
-
-function setIdx(idx) {
-  selectedIdx = idx;
-  ['NIFTY', 'BN', 'SX'].forEach(k => document.getElementById('btn_' + k).classList.toggle('active', k === idx));
-  renderChain();
-}
-
-function setDepth(d) {
-  chainDepth = d;
-  document.getElementById('dep_5').classList.toggle('active', d === 5);
-  document.getElementById('dep_12').classList.toggle('active', d === 12);
-  renderChain();
-}
-
-function updateBlock(prefix, t) {
-  let sp = (t[prefix + "_SPOT"] || {}).lp || 0;
-  let f1 = t[prefix + "_F1"] || {};
-  let f2 = t[prefix + "_F2"] || {};
-  let p = prefix === "NIFTY" ? "n" : (prefix === "BN" ? "bn" : "sx");
-  document.getElementById(p + "_sp").innerText = sp || "--";
-  if (f1.lp) {
-    document.getElementById(p + "_f1_name").innerText = f1.tsym || "Current Fut";
-    document.getElementById(p + "_f1_lp").innerText = f1.lp;
-    document.getElementById(p + "_f1_oi").innerText = f1.oi || 0;
-    document.getElementById(p + "_f1_v").innerText = f1.v || 0;
-    document.getElementById(p + "_f1_prem").innerText = "Basis: " + (sp ? (f1.lp - sp).toFixed(1) : "--");
-  }
-  if (f2.lp) {
-    document.getElementById(p + "_f2_name").innerText = f2.tsym || "Next Fut";
-    document.getElementById(p + "_f2_lp").innerText = f2.lp;
-    document.getElementById(p + "_f2_oi").innerText = f2.oi || 0;
-    document.getElementById(p + "_f2_v").innerText = f2.v || 0;
-    document.getElementById(p + "_f2_prem").innerText = "Basis: " + (sp ? (f2.lp - sp).toFixed(1) : "--");
-  }
-}
-
-function renderHeavyweights() {
-  let hw = (latestData.analytics || {}).heavyweights;
-  if (!hw) return;
-  document.getElementById('hw_summary').innerHTML = `Breadth: <strong style="color:#fbbf24;">${hw.breadth}</strong> &nbsp;|&nbsp; Nifty Impact: <strong style="color:${hw.nifty_pts>=0?'#4ade80':'#f87171'};">${hw.nifty_pts>=0?'+':''}${hw.nifty_pts} pts</strong> &nbsp;|&nbsp; BankNifty Impact: <strong style="color:${hw.bn_pts>=0?'#4ade80':'#f87171'};">${hw.bn_pts>=0?'+':''}${hw.bn_pts} pts</strong>`;
-  let htm = "";
-  (hw.stocks || []).forEach(s => {
-    let clr = s.chg_pct >= 0 ? "#4ade80" : "#f87171";
-    htm += `<div class="hw-tile" style="border-left:3px solid ${clr};">
-      <div style="display:flex;justify-content:space-between;font-weight:bold;font-size:12px;">
-        <span>${s.sym}</span><span style="color:${clr};">${s.chg_pct>=0?'+':''}${s.chg_pct}%</span>
-      </div>
-      <div style="font-size:11px;color:#cbd5e1;margin-top:3px;">₹${s.lp} (${s.n_pts>=0?'+':''}${s.n_pts} pts)</div>
-      <div style="font-size:10px;color:#38bdf8;margin-top:2px;">${s.buildup}</div>
-    </div>`;
+function switchTab(num, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  ['tab1', 'tab2', 'tab3'].forEach((id, i) => {
+    document.getElementById(id).classList.toggle('hidden', (i + 1) !== num);
   });
-  document.getElementById('hw_grid').innerHTML = htm;
 }
 
-function renderPositionalCards() {
-  let titles = {"NIFTY": "NIFTY 50 — Positional Swing (3–15 Days)", "BN": "BANK NIFTY — Positional Swing (3–15 Days)", "SX": "SENSEX — Positional Swing (3–15 Days)"};
-  ['NIFTY', 'BN', 'SX'].forEach(tag => {
-    let a = (latestData.analytics || {})[tag];
-    let el = document.getElementById('pos_' + tag);
-    if (!a || !a.positional) return;
-    let p = a.positional;
-    el.innerHTML = `
-      <div style="color:#94a3b8;font-size:12px;font-weight:bold;">${titles[tag]}</div>
-      <div class="regime-banner">${p.pos_action}</div>
-      <div class="pos-row"><span>Term Structure Regime:</span><strong style="color:#38bdf8;">${p.term_structure}</strong></div>
-      <div class="pos-row"><span>2M Rollover Spread (F2 - F1):</span><strong>${p.cal_spread} pts (${p.ann_carry}% Annual Carry)</strong></div>
-      <div class="pos-row"><span>ATM IV & Volatility Skew:</span><strong>${p.atm_iv}% | Skew: ${p.iv_skew > 0 ? '+' : ''}${p.iv_skew}%</strong></div>
-      <div class="pos-row"><span>Broad ATM ±12 PCR & Max Pain:</span><strong>PCR ${p.broad_pcr} | Max Pain ${p.max_pain}</strong></div>
-      <div class="pos-row"><span>Positional OI Range (Support – Res):</span><strong style="color:#fbbf24;">${p.broad_sup} – ${p.broad_res}</strong></div>
-      <div class="pos-row" style="border:none;"><span>10-Day Expected Swing Cone (±1σ):</span><strong style="color:#4ade80;">${p.swing_low} – ${p.swing_high} (±${p.swing_move} pts)</strong></div>
-    `;
-  });
+function setActiveIdx(idx, btn) {
+  ACTIVE_IDX = idx;
+  document.querySelectorAll('.idx-switch button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (STATE) renderChain();
+}
+
+function selectStock(sym) {
+  SELECTED_STOCK = sym;
+  switchTab(3, document.querySelectorAll('.tab-btn')[2]);
+  if (STATE) renderStockChain();
+}
+
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString('en-IN');
 }
 
 function renderChain() {
-  let a = (latestData.analytics || {})[selectedIdx];
-  if (!a) return;
+  const ch = (STATE.chains || {})[ACTIVE_IDX];
+  if (!ch) return;
+  document.getElementById('chainMetrics').innerHTML = `
+    <div class="metric-box"><div class="metric-lbl">NET GEX &amp; GAMMA FLIP</div><div class="metric-val cyan">${ch.net_gex_cr} Cr | Flip: ${fmtNum(ch.gamma_flip)}</div></div>
+    <div class="metric-box"><div class="metric-lbl">ATM IV &amp; ORDER SWEEP</div><div class="metric-val amber">IV: ${ch.atm_iv}% | Sweep: ${ch.sweep_bias}%</div></div>
+    <div class="metric-box"><div class="metric-lbl">MAX PAIN &amp; PCR</div><div class="metric-val green">Max Pain: ${fmtNum(ch.max_pain)} | PCR: ${ch.pcr}</div></div>
+    <div class="metric-box"><div class="metric-lbl">STRIKES TRACKED</div><div class="metric-val">ATM ±12 (${ch.rows.length} Strikes)</div></div>
+  `;
 
-  let sb = document.getElementById('shield_box');
-  sb.innerText = a.spike_shield;
-  sb.className = "shield-banner" + (a.shield_level === "DANGER" ? " danger" : "");
-
-  let db = document.getElementById('decision_box');
-  db.innerText = a.pro_action;
-  db.className = "decision-banner " + (a.action_cls || "sell");
-
-  document.getElementById('cp_gex').innerText = `${a.net_gex} Cr | Flip: ${a.gamma_flip}`;
-  document.getElementById('cp_vel').innerText = `${a.tps}/s | 3m ΔIV: ${a.iv_vel_3m >= 0 ? '+' : ''}${a.iv_vel_3m}% | ${a.ob_signal}`;
-  document.getElementById('cp_mp').innerText = `Max Pain: ${a.max_pain} | Strad: ₹${a.straddle}`;
-  document.getElementById('cp_syn').innerText = `Syn: ${a.synth_fut} (${a.synth_diff >= 0 ? '+' : ''}${a.synth_diff}) | PCR: ${a.pcr}`;
-
-  let alertBox = document.getElementById('smart_alert');
-  if (a.alerts && a.alerts.length > 0) {
-    alertBox.style.display = 'block';
-    alertBox.innerHTML = "🚨 <strong>SMART MONEY FOOTPRINT (ATM ±6 to ±12 Scan):</strong> &nbsp;" + a.alerts.join(" &nbsp;|&nbsp; ");
-  } else {
-    alertBox.style.display = 'none';
-  }
-
-  let rows = chainDepth === 12 ? (a.rows_12 || []) : (a.rows_5 || []);
-  let peak = (chainDepth === 12 ? a.peak_oi_12 : a.peak_oi_5) || 1;
-  let html = "";
-  rows.forEach(r => {
-    let isAtm = r.strike === a.atm ? "atm-row" : "";
-    let ce = r.CE || {}, pe = r.PE || {};
-    let cePct = Math.min(100, Math.round(((ce.oi || 0) / peak) * 100));
-    let pePct = Math.min(100, Math.round(((pe.oi || 0) / peak) * 100));
-
-    html += `<tr class="${isAtm}">
-      <td class="oi-cell"><div>${(ce.oi || 0).toLocaleString()}</div><div class="oi-bar-ce" style="width:${cePct}%;"></div></td>
-      <td><span class="tag-quad">${ce.quad || "-"}</span></td>
-      <td style="color:#cbd5e1;">${ce.iv || "--"}%</td>
-      <td style="color:#94a3b8;">${ce.delta || "--"} / ${ce.gamma || "--"}</td>
-      <td style="color:#38bdf8;font-weight:bold;">${ce.lp || 0}</td>
-      <td class="strike-col">${r.strike}</td>
-      <td style="text-align:left;color:#f472b6;font-weight:bold;">${pe.lp || 0}</td>
-      <td style="color:#94a3b8;">${pe.delta || "--"} / ${pe.gamma || "--"}</td>
-      <td style="color:#cbd5e1;">${pe.iv || "--"}%</td>
-      <td><span class="tag-quad">${pe.quad || "-"}</span></td>
-      <td class="oi-cell" style="text-align:left;"><div>${(pe.oi || 0).toLocaleString()}</div><div class="oi-bar-pe" style="width:${pePct}%;"></div></td>
+  let html = '';
+  ch.rows.forEach(r => {
+    const ceCls = r.ce_act === 'SHORT COVERING' ? 'b-buy' : (r.ce_act === 'CALL WRITING' ? 'b-sell' : 'b-neu');
+    const peCls = r.pe_act === 'PUT WRITING' ? 'b-buy' : (r.pe_act === 'LONG UNWINDING' ? 'b-sell' : 'b-neu');
+    html += `<tr class="${r.is_atm ? 'atm-row' : ''}">
+      <td>${fmtNum(r.ce.oi)} <span class="${r.ce.doi>=0?'green':'red'}">(${r.ce.doi>=0?'+':''}${fmtNum(r.ce.doi)})</span></td>
+      <td><span class="badge ${ceCls}">${r.ce_act}</span></td>
+      <td>${r.ce.iv}%</td>
+      <td>${r.ce.delta} / ${r.ce.gamma}</td>
+      <td class="red">${r.ce.theta}</td>
+      <td class="cyan"><strong>${r.ce.lp.toFixed(2)}</strong></td>
+      <td style="color:#fbbf24; font-weight:800;">${r.strike}</td>
+      <td class="cyan"><strong>${r.pe.lp.toFixed(2)}</strong></td>
+      <td class="red">${r.pe.theta}</td>
+      <td>${r.pe.delta} / ${r.pe.gamma}</td>
+      <td>${r.pe.iv}%</td>
+      <td><span class="badge ${peCls}">${r.pe_act}</span></td>
+      <td>${fmtNum(r.pe.oi)} <span class="${r.pe.doi>=0?'green':'red'}">(${r.pe.doi>=0?'+':''}${fmtNum(r.pe.doi)})</span></td>
     </tr>`;
   });
-  document.getElementById('oc_body').innerHTML = html;
+  document.getElementById('chainBody').innerHTML = html;
 }
 
-setInterval(() => {
-  fetch('/api/state').then(r => r.json()).then(d => {
-    latestData = d;
-    document.getElementById('tm').innerText = d.last_update;
-    if (d.micro && d.micro.mode) document.getElementById('ws_mode').innerText = "● " + d.micro.mode;
-    updateBlock("NIFTY", d.ticks || {});
-    updateBlock("BN", d.ticks || {});
-    updateBlock("SX", d.ticks || {});
-    renderHeavyweights();
-    renderChain();
-    renderPositionalCards();
+function renderStockChain() {
+  const sc = (STATE.stock_chains || {})[SELECTED_STOCK];
+  const hw = (STATE.heavyweights || []).find(x => x.sym === SELECTED_STOCK);
+  document.getElementById('stkChainTitle').innerText = `${SELECTED_STOCK} — Live Stock Option Chain & Greeks (Positional & Intraday)`;
+  if (hw) {
+    document.getElementById('stkChainMeta').innerText = `Spot: ₹${hw.lp} (${hw.chg_pct>=0?'+':''}${hw.chg_pct}%) | ${hw.buildup} | ${hw.stk_signal}`;
+  }
+  if (!sc || !sc.rows || !sc.rows.length) {
+    document.getElementById('stkChainBody').innerHTML = `<tr><td colspan="11">Loading ${SELECTED_STOCK} option strikes...</td></tr>`;
+    return;
+  }
+  let html = '';
+  sc.rows.forEach(r => {
+    html += `<tr class="${r.is_atm ? 'atm-row' : ''}">
+      <td>${fmtNum(r.ce.oi)}</td>
+      <td>${r.ce.iv}%</td>
+      <td>${r.ce.delta} / ${r.ce.gamma}</td>
+      <td class="red">${r.ce.theta}</td>
+      <td class="cyan"><strong>${r.ce.lp.toFixed(2)}</strong></td>
+      <td style="color:#fbbf24; font-weight:800;">${r.strike}</td>
+      <td class="cyan"><strong>${r.pe.lp.toFixed(2)}</strong></td>
+      <td class="red">${r.pe.theta}</td>
+      <td>${r.pe.delta} / ${r.pe.gamma}</td>
+      <td>${r.pe.iv}%</td>
+      <td>${fmtNum(r.pe.oi)}</td>
+    </tr>`;
   });
-}, 400);
+  document.getElementById('stkChainBody').innerHTML = html;
+}
+
+function renderAll(data) {
+  STATE = data;
+  const d = data.decision;
+  const t = data.ticks || {};
+
+  document.getElementById('modeBadge').innerText = data.micro.mode || 'LIVE';
+  document.getElementById('tpsBadge').innerText = `${data.micro.ticks_per_sec || 0} ticks/s`;
+  document.getElementById('regimeText').innerText = d.regime;
+  document.getElementById('regimeText').style.color = d.regime_color;
+  document.getElementById('topMoversText').innerText = (d.top_movers || []).join('  |  ');
+  document.getElementById('nImpact').innerText = (d.nifty_pts >= 0 ? '+' : '') + d.nifty_pts;
+  document.getElementById('sxImpact').innerText = (d.sensex_pts >= 0 ? '+' : '') + d.sensex_pts;
+
+  const banner = document.getElementById('actionBanner');
+  banner.style.background = d.banner_bg;
+  banner.style.borderLeftColor = d.border_c;
+  document.getElementById('actionTitle').innerText = d.action;
+  document.getElementById('actionSub').innerText = d.sub;
+
+  const ex = document.getElementById('exitBox');
+  if (d.exit_alert) {
+    ex.innerText = d.exit_alert;
+    ex.classList.remove('hidden');
+  } else {
+    ex.classList.add('hidden');
+  }
+
+  // Index Cards
+  const idxDefs = [
+    {title: 'NIFTY 50 SPOT', sp: 'NIFTY_SPOT', f1: 'NIFTY_F1', f2: 'NIFTY_F2'},
+    {title: 'BANKNIFTY SPOT', sp: 'BN_SPOT', f1: 'BN_F1', f2: 'BN_F2'},
+    {title: 'SENSEX SPOT', sp: 'SX_SPOT', f1: 'SX_F1', f2: 'SX_F2'}
+  ];
+  let cardsHtml = '';
+  idxDefs.forEach(x => {
+    const sp = (t[x.sp] || {}).lp || 0;
+    const f1 = t[x.f1] || {};
+    const f2 = t[x.f2] || {};
+    const b1 = (f1.lp && sp) ? (f1.lp - sp).toFixed(1) : '0.0';
+    const b2 = (f2.lp && sp) ? (f2.lp - sp).toFixed(1) : '0.0';
+    cardsHtml += `<div class="card">
+      <div class="idx-title">${x.title}</div>
+      <div class="idx-spot">${Number(sp).toLocaleString('en-IN', {minimumFractionDigits:2})}</div>
+      <div class="fut-row"><span>${f1.tsym || 'NEAR FUT'} (OI ${fmtNum(f1.oi)})</span><span class="green">${f1.lp || 0} (Basis +${b1})</span></div>
+      <div class="fut-row"><span>${f2.tsym || 'NEXT FUT'} (OI ${fmtNum(f2.oi)})</span><span class="cyan">${f2.lp || 0} (Basis +${b2})</span></div>
+    </div>`;
+  });
+  document.getElementById('idxCards').innerHTML = cardsHtml;
+
+  // Top 10 Strip
+  const hws = data.heavyweights || [];
+  document.getElementById('breadthSummary').innerText = `Breadth: ${d.green_cnt}/${d.total_hws} Green | Nifty ${d.nifty_pts>=0?'+':''}${d.nifty_pts} pts | Sensex ${d.sensex_pts>=0?'+':''}${d.sensex_pts} pts`;
+  let stripHtml = '';
+  hws.slice(0, 10).forEach(h => {
+    const c = h.chg_pct >= 0 ? 'green' : 'red';
+    stripHtml += `<div class="hw-box" onclick="selectStock('${h.sym}')">
+      <div style="font-weight:800; font-size:11px;">${h.sym} <span class="${c}">${h.chg_pct>=0?'+':''}${h.chg_pct}%</span></div>
+      <div style="font-size:10.5px; color:#94a3b8; margin-top:2px;">₹${h.lp} (${h.nifty_pts>=0?'+':''}${h.nifty_pts}p)</div>
+      <div style="font-size:9.5px; margin-top:2px;" class="cyan">${h.buildup}</div>
+    </div>`;
+  });
+  document.getElementById('top10Strip').innerHTML = stripHtml;
+
+  // Tab 2 Positional
+  document.getElementById('posVerdict').innerText = d.pos_verdict;
+  document.getElementById('posReason').innerText = d.pos_reason;
+  document.getElementById('posGrid').innerHTML = `
+    <div class="card"><div class="idx-title">NIFTY POSITIONAL (3–15D)</div><div class="metric-val cyan">Max Pain: ${data.chains.NIFTY.max_pain} | PCR: ${data.chains.NIFTY.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.NIFTY.atm_iv}% | F1–F2 Roll Spread: +${d.roll_spread} pts</div></div>
+    <div class="card"><div class="idx-title">BANKNIFTY POSITIONAL (3–15D)</div><div class="metric-val amber">Max Pain: ${data.chains.BN.max_pain} | PCR: ${data.chains.BN.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.BN.atm_iv}% | Net GEX: ${data.chains.BN.net_gex_cr} Cr</div></div>
+    <div class="card"><div class="idx-title">SENSEX POSITIONAL (3–15D)</div><div class="metric-val green">Max Pain: ${data.chains.SX.max_pain} | PCR: ${data.chains.SX.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.SX.atm_iv}% | Net GEX: ${data.chains.SX.net_gex_cr} Cr</div></div>
+  `;
+
+  // Tab 3 All 30 Stocks Table
+  let t3Html = '';
+  hws.forEach(h => {
+    const c = h.chg_pct >= 0 ? 'green' : 'red';
+    t3Html += `<tr style="cursor:pointer;" onclick="selectStock('${h.sym}')">
+      <td style="font-weight:800; color:#f8fafc;">${h.sym}</td>
+      <td>₹${h.lp}</td>
+      <td class="${c}"><strong>${h.chg_pct>=0?'+':''}${h.chg_pct}%</strong></td>
+      <td class="${h.nifty_pts>=0?'green':'red'}">${h.nifty_pts>=0?'+':''}${h.nifty_pts}</td>
+      <td class="${h.sensex_pts>=0?'green':'red'}">${h.sensex_pts>=0?'+':''}${h.sensex_pts}</td>
+      <td class="cyan">${h.buildup}</td>
+      <td>${h.atm_iv}%</td>
+      <td>${h.atm_delta} / ${h.atm_gamma}</td>
+      <td><span class="badge ${h.chg_pct>=0?'b-buy':'b-sell'}">${h.stk_signal}</span></td>
+    </tr>`;
+  });
+  document.getElementById('all30Body').innerHTML = t3Html;
+
+  renderChain();
+  renderStockChain();
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/state');
+    const data = await res.json();
+    if (data && data.decision) renderAll(data);
+  } catch (e) {}
+  setTimeout(poll, 700);
+}
+poll();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_DASHBOARD)
+    return render_template_string(HTML_PAGE)
 
 @app.route("/api/batch", methods=["POST"])
 def receive_batch():
-    data = request.get_json(force=True)
-    LIVE_STATE["micro"] = data.get("micro", {})
-    LIVE_STATE["ticks"] = data.get("ticks", {})
-    LIVE_STATE["heavyweights"] = data.get("heavyweights", [])
-    LIVE_STATE["chains"] = data.get("chains", {})
-    LIVE_STATE["analytics"] = compute_master_analytics(LIVE_STATE["ticks"], LIVE_STATE["chains"], LIVE_STATE["micro"], LIVE_STATE["heavyweights"])
-    LIVE_STATE["last_update"] = time.strftime("%H:%M:%S")
+    payload = request.get_json(silent=True) or {}
+    LATEST_STATE["ts"] = time.time()
+    LATEST_STATE["micro"] = payload.get("micro", LATEST_STATE["micro"])
+    LATEST_STATE["ticks"] = payload.get("ticks", LATEST_STATE["ticks"])
+    LATEST_STATE["heavyweights"] = payload.get("heavyweights", LATEST_STATE["heavyweights"])
+    LATEST_STATE["chains"] = payload.get("chains", LATEST_STATE["chains"])
+    LATEST_STATE["stock_chains"] = payload.get("stock_chains", LATEST_STATE["stock_chains"])
     return jsonify({"ok": True})
 
 @app.route("/api/state")
 def get_state():
-    return jsonify(LIVE_STATE)
+    return jsonify(compute_decision_engine(LATEST_STATE))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
