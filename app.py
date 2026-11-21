@@ -14,7 +14,6 @@ LATEST_STATE = {
     "stock_chains": {}
 }
 
-# Anti-Flicker Signal Lock State
 SIGNAL_LOCK = {
     "confirmed_key": "",
     "candidate_key": "",
@@ -89,7 +88,7 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
             "pcr": 1.0, "atm_iv": 13.5, "ce_atm_iv": 13.5, "pe_atm_iv": 13.5,
             "sweep_bias": 0.0, "tot_ce_oi": 0, "tot_pe_oi": 0,
             "atm_strike": 0, "atm_ce_lp": 0, "atm_pe_lp": 0,
-            "call_wall": 0, "put_wall": 0, "ce_sc_total": 0, "pe_unwind_total": 0
+            "call_wall": 0, "put_wall": 0, "itm_flow": "BALANCED"
         }
     T = max(dte_days, 0.25) / 365.0
     r = 0.065
@@ -99,7 +98,7 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
     max_oi = 1
     call_wall_k, call_wall_oi = 0, -1
     put_wall_k, put_wall_oi = 0, -1
-    ce_sc_total, pe_unwind_total = 0, 0
+    itm_ce_doi, itm_pe_doi = 0, 0
 
     for item in raw_rows:
         k = int(item.get("strike", 0))
@@ -122,20 +121,20 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
             tot_ce_oi += oi
             tot_tbq += tbq
             tot_tsq += tsq
+            if k < spot:
+                itm_ce_doi += doi
             if k >= spot and oi > call_wall_oi:
                 call_wall_oi = oi
                 call_wall_k = k
-            if doi < 0:
-                ce_sc_total += abs(doi)
         else:
             tot_pe_oi += oi
             tot_tbq += tsq
             tot_tsq += tbq
+            if k > spot:
+                itm_pe_doi += doi
             if k <= spot and oi > put_wall_oi:
                 put_wall_oi = oi
                 put_wall_k = k
-            if doi < 0:
-                pe_unwind_total += abs(doi)
 
         if k not in by_strike:
             by_strike[k] = {"strike": k}
@@ -203,6 +202,17 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
     pcr = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 1.0
     sweep_bias = round(((tot_tbq - tot_tsq) / max(tot_tbq + tot_tsq, 1)) * 100, 1)
 
+    if itm_ce_doi < -15000:
+        itm_flow = "ITM CALL WRITERS TRAPPED (SQUEEZE)"
+    elif itm_ce_doi > 15000:
+        itm_flow = "ITM CALL BUYING (INSTITUTIONAL)"
+    elif itm_pe_doi > 15000:
+        itm_flow = "ITM PUT BUYING (BEARISH)"
+    elif itm_pe_doi < -15000:
+        itm_flow = "ITM PUT WRITERS TRAPPED (DROP)"
+    else:
+        itm_flow = "BALANCED ITM FLOW"
+
     return {
         "rows": rows_out,
         "net_gex_cr": round(net_gex / 1e7, 1),
@@ -220,8 +230,7 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
         "atm_pe_lp": atm_pe_lp,
         "call_wall": call_wall_k or (atm_strike + 4 * step),
         "put_wall": put_wall_k or (atm_strike - 4 * step),
-        "ce_sc_total": ce_sc_total,
-        "pe_unwind_total": pe_unwind_total
+        "itm_flow": itm_flow
     }
 
 def compute_decision_engine(state):
@@ -236,6 +245,14 @@ def compute_decision_engine(state):
     n_chain = enrich_chain(state.get("chains", {}).get("NIFTY", []), n_spot, step=50, lot_size=75, dte_days=3.5)
     bn_chain = enrich_chain(state.get("chains", {}).get("BN", []), bn_spot, step=100, lot_size=30, dte_days=3.5)
     sx_chain = enrich_chain(state.get("chains", {}).get("SX", []), sx_spot, step=100, lot_size=20, dte_days=3.5)
+
+    raw_stk_chains = state.get("stock_chains", {})
+    enriched_stk_chains = {}
+    for h in hws:
+        sym = h.get("sym", "")
+        sp = float(h.get("lp", 0) or 0)
+        if sym in raw_stk_chains:
+            enriched_stk_chains[sym] = enrich_chain(raw_stk_chains[sym], sp, step=10, lot_size=500, dte_days=12.0)
 
     green_cnt = 0
     nifty_pts = 0.0
@@ -274,16 +291,50 @@ def compute_decision_engine(state):
             buildup = "LONG UNWINDING"
 
         stk_lp = float(h.get("lp", 0) or 0)
-        stk_iv = float(h.get("atm_iv", 22.5) or 22.5)
+        sc_obj = enriched_stk_chains.get(sym)
+        stk_iv = sc_obj["atm_iv"] if sc_obj else float(h.get("atm_iv", 22.5) or 22.5)
         stk_gk = bs_greeks(stk_lp, stk_lp, 12.0 / 365.0, 0.065, stk_iv / 100.0, "CE")
-        if chg > 0.8 and f_doi > 0:
-            stk_sig = "BUY CALL / BULL SPREAD"
-        elif chg < -0.8 and f_doi > 0:
-            stk_sig = "BUY PUT / BEAR SPREAD"
-        elif abs(chg) < 0.45:
-            stk_sig = "SELL STRANGLE (THETA)"
+        atm_k_stk = sc_obj["atm_strike"] if (sc_obj and sc_obj["atm_strike"] > 0) else round(stk_lp, 0)
+        c_wall_stk = sc_obj["call_wall"] if (sc_obj and sc_obj["call_wall"] > 0) else round(stk_lp * 1.025, 0)
+        p_wall_stk = sc_obj["put_wall"] if (sc_obj and sc_obj["put_wall"] > 0) else round(stk_lp * 0.975, 0)
+
+        # ITM Institutional Flow Classification
+        if sc_obj and sc_obj["itm_flow"] != "BALANCED ITM FLOW":
+            itm_tag = sc_obj["itm_flow"]
+        elif chg > 0.75 and f_doi > 0:
+            itm_tag = "ITM CALL BUYING (INSTITUTIONAL)"
+        elif chg < -0.75 and f_doi > 0:
+            itm_tag = "ITM PUT BUYING (BEARISH)"
+        elif chg > 0.65 and f_doi < 0:
+            itm_tag = "ITM WRITERS TRAPPED (SQUEEZE)"
         else:
-            stk_sig = "SELL OTM PUT" if chg > 0 else "SELL OTM CE"
+            itm_tag = "NEUTRAL ITM FLOW"
+
+        # Intraday vs Positional Classification + Data Exit Rule
+        if chg > 0.85 and f_doi > 0:
+            horizon = "BOTH: INTRADAY 2%+ BREAKOUT & POSITIONAL (3–15D)"
+            stk_sig = f"BUY {atm_k_stk} CE (1-ITM/ATM) | BULL SPREAD"
+            exit_rule = f"EXIT IF: Fut OI starts unwinding or price slips below ₹{round(stk_lp * 0.992, 1)} (Book Partial at Call Wall ₹{c_wall_stk})"
+            bull_score = (chg * 12) + (abs(n_imp) * 3) + (15 if f_doi > 0 else 0) + (vel_30s * 20)
+            bear_score = -999
+        elif chg < -0.85 and f_doi > 0:
+            horizon = "BOTH: INTRADAY 2%+ BREAKDOWN & POSITIONAL (3–15D)"
+            stk_sig = f"BUY {atm_k_stk} PE (1-ITM/ATM) | BEAR SPREAD"
+            exit_rule = f"EXIT IF: Fut OI covers or price reclaims ₹{round(stk_lp * 1.008, 1)} (Book Partial at Put Wall ₹{p_wall_stk})"
+            bear_score = (abs(chg) * 12) + (abs(n_imp) * 3) + (15 if f_doi > 0 else 0) + (abs(vel_30s) * 20)
+            bull_score = -999
+        elif chg >= 0:
+            horizon = "INTRADAY SCALP / SELL OTM PUT"
+            stk_sig = f"SELL {p_wall_stk} PE (THETA)"
+            exit_rule = f"EXIT IF: Price breaks Put Support Wall ₹{p_wall_stk}"
+            bull_score = (chg * 10) + (abs(n_imp) * 2)
+            bear_score = -999
+        else:
+            horizon = "INTRADAY SCALP / SELL OTM CE"
+            stk_sig = f"SELL {c_wall_stk} CE (THETA)"
+            exit_rule = f"EXIT IF: Price breaks Call Resistance Wall ₹{c_wall_stk}"
+            bear_score = (abs(chg) * 10) + (abs(n_imp) * 2)
+            bull_score = -999
 
         item = dict(h)
         item.update({
@@ -294,9 +345,17 @@ def compute_decision_engine(state):
             "atm_iv": stk_iv,
             "atm_delta": stk_gk["delta"],
             "atm_gamma": stk_gk["gamma"],
-            "stk_signal": stk_sig
+            "itm_tag": itm_tag,
+            "horizon": horizon,
+            "stk_signal": stk_sig,
+            "exit_rule": exit_rule,
+            "bull_score": bull_score,
+            "bear_score": bear_score
         })
         enriched_hws.append(item)
+
+    top2_bull = sorted([x for x in enriched_hws if x["chg_pct"] > 0], key=lambda x: x["bull_score"], reverse=True)[:2]
+    top2_bear = sorted([x for x in enriched_hws if x["chg_pct"] < 0], key=lambda x: x["bear_score"], reverse=True)[:2]
 
     enriched_hws.sort(key=lambda x: abs(x["nifty_pts"]), reverse=True)
     top_movers = [f"{x['sym']} ({'+' if x['nifty_pts']>=0 else ''}{x['nifty_pts']}p)" for x in enriched_hws[:3]]
@@ -316,7 +375,6 @@ def compute_decision_engine(state):
     breadth_ratio = green_cnt / total_hws
     dist_mp_pct = (abs(n_spot - mp) / max(n_spot, 1)) * 100.0
 
-    # Determine Raw Candidate Signal
     if gex < -150 and (breadth_ratio >= 0.70 or breadth_ratio <= 0.30) and iv >= 14.2:
         if breadth_ratio >= 0.70 and (pcr >= 1.02 or sweep > 8):
             raw_key = "GAMMA_BUY_CE"
@@ -384,7 +442,6 @@ def compute_decision_engine(state):
             banner_bg = "linear-gradient(90deg, #1e3a8a, #0369a1)"
             border_c = "#38bdf8"
 
-    # Anti-Flicker 3-Cycle Confirmation + 1-Minute (60s) Blink Lock
     now_ts = time.time()
     if not SIGNAL_LOCK["confirmed_key"]:
         SIGNAL_LOCK["confirmed_key"] = raw_key
@@ -410,14 +467,12 @@ def compute_decision_engine(state):
     is_blinking_1min = (secs_since_shift <= 60.0)
     blink_remaining = max(0, int(60 - secs_since_shift))
 
-    # Lead Indicator Warning from 30-Sec Stock Velocity
     lead_alert = None
     if vel_score > 14.0 and breadth_ratio >= 0.65:
         lead_alert = f"30-SEC STOCK LEAD SURGE (BULLISH): Top Heavyweights Accelerating -> Nifty {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)}p | BN {'+' if bn_pts>=0 else ''}{round(bn_pts,1)}p | Sensex {'+' if sensex_pts>=0 else ''}{round(sensex_pts,1)}p"
     elif vel_score < -14.0 and breadth_ratio <= 0.35:
         lead_alert = f"30-SEC STOCK LEAD DROP (BEARISH): Top Heavyweights Selling -> Nifty {round(nifty_pts,1)}p | BN {round(bn_pts,1)}p | Sensex {round(sensex_pts,1)}p"
 
-    # Positional 3-15 Day Assessment
     basis_f1 = round(n_f1 - n_spot, 1)
     roll_spread = round(n_f2 - n_f1, 1)
     if iv < 13.0 and breadth_ratio >= 0.60:
@@ -429,13 +484,6 @@ def compute_decision_engine(state):
     else:
         pos_verdict = "POSITIONAL BULL PUT / RATIO SPREAD (3 TO 15 DAYS)"
         pos_reason = f"F1 Basis +{basis_f1} pts | Net Nifty Impact {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)} pts | Sensex {'+' if sensex_pts>=0 else ''}{round(sensex_pts,1)} pts."
-
-    raw_stk_chains = state.get("stock_chains", {})
-    enriched_stk_chains = {}
-    hw_map = {x["sym"]: x for x in enriched_hws}
-    for sym, srows in raw_stk_chains.items():
-        sp = float((hw_map.get(sym) or {}).get("lp", 0) or 0)
-        enriched_stk_chains[sym] = enrich_chain(srows, sp, step=10, lot_size=500, dte_days=12.0)
 
     return {
         "micro": state.get("micro", {}),
@@ -462,7 +510,9 @@ def compute_decision_engine(state):
             "pos_verdict": pos_verdict,
             "pos_reason": pos_reason,
             "basis_f1": basis_f1,
-            "roll_spread": roll_spread
+            "roll_spread": roll_spread,
+            "top2_bull": top2_bull,
+            "top2_bear": top2_bear
         },
         "chains": {
             "NIFTY": n_chain,
@@ -477,7 +527,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>GammaShield v2.5 — Institutional Options, Futures & 30-Stock Terminal</title>
+<title>GammaShield v2.6 — Institutional Options, Futures & 30-Stock Terminal</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Roboto, Arial, sans-serif; }
   body { background: #070b14; color: #e2e8f0; padding: 12px 18px; font-size: 13px; }
@@ -500,7 +550,10 @@ HTML_PAGE = """<!DOCTYPE html>
   .trade-box { margin-top: 7px; background: rgba(0,0,0,0.35); border: 1px dashed rgba(255,255,255,0.35); padding: 6px 10px; border-radius: 4px; font-weight: 800; color: #fef08a; font-size: 12.5px; }
   .lead-bar { background: #1e1b4b; border: 1px solid #6366f1; color: #c7d2fe; padding: 6px 12px; border-radius: 5px; font-weight: 700; margin-bottom: 8px; font-size: 12px; }
   .idx-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
+  .top4-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px; }
   .card { background: #0d1424; border: 1px solid #1e293b; border-radius: 6px; padding: 10px 12px; }
+  .bull-card { background: linear-gradient(135deg, #06281e, #0d1424); border: 1px solid #10b981; border-left: 5px solid #10b981; border-radius: 6px; padding: 10px 12px; cursor: pointer; }
+  .bear-card { background: linear-gradient(135deg, #2d0b14, #0d1424); border: 1px solid #ef4444; border-left: 5px solid #ef4444; border-radius: 6px; padding: 10px 12px; cursor: pointer; }
   .idx-title { font-size: 11px; color: #94a3b8; font-weight: 700; }
   .idx-spot { font-size: 22px; font-weight: 800; color: #38bdf8; margin: 2px 0 6px 0; }
   .fut-row { display: flex; justify-content: space-between; background: #131c31; padding: 5px 8px; border-radius: 4px; margin-top: 4px; font-size: 11.5px; }
@@ -539,7 +592,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 
 <div class="topbar">
-  <div class="brand">&#9724; GammaShield <span>v2.5</span> — 80/20 Institutional Options, Futures &amp; 30-Stock Terminal</div>
+  <div class="brand">&#9724; GammaShield <span>v2.6</span> — 80/20 Institutional Options, Futures &amp; 30-Stock Terminal</div>
   <div>
     <button id="muteBtn" class="mute-btn" onclick="toggleSound()">&#128266; CHIME ON</button>
     <span id="tpsBadge" style="color:#94a3b8; margin-right:10px; font-size:11.5px;">0 ticks/s</span>
@@ -550,7 +603,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="tabs">
   <button class="tab-btn active" onclick="switchTab(1, this)">1. Intraday 80/20 Execution &amp; Gamma Shield</button>
   <button class="tab-btn" onclick="switchTab(2, this)">2. Positional Swing &amp; Term-Structure (3–15 Days)</button>
-  <button class="tab-btn" onclick="switchTab(3, this)">3. All 30 Stocks Lead Attribution, Futures &amp; Stock Options</button>
+  <button class="tab-btn" onclick="switchTab(3, this)">3. Top 2 Bull / Top 2 Bear Radar + All 30 Stocks &amp; ITM Flow</button>
 </div>
 
 <div class="regime-strip">
@@ -620,18 +673,24 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="idx-grid" id="posGrid"></div>
 </div>
 
-<!-- TAB 3: ALL 30 STOCKS ATTRIBUTION, FUTURES & INTERACTIVE STOCK OPTION CHAIN -->
+<!-- TAB 3: TOP 2 BULL / TOP 2 BEAR RADAR + ALL 30 STOCKS + ITM FLOW + CLICK-ON-STOCK OPTION CHAIN -->
 <div id="tab3" class="hidden">
+  <div class="section-hdr" style="margin-top:0;">
+    <div style="color:#fbbf24;">&#9889; INSTITUTIONAL 2%+ STOCK BREAKOUT &amp; EXIT RADAR (TOP 2 BULL &amp; TOP 2 BEAR — CLICK CARD FOR OPTION CHAIN)</div>
+    <div class="cyan">Intraday Momentum + 3–15D Positional Carry</div>
+  </div>
+  <div class="top4-grid" id="top4Grid"></div>
+
   <div class="section-hdr">
-    <div>All 30 Sensex + Nifty Heavyweights — 3-Index Point Attribution, Futures Buildup &amp; Stock Greeks (Click Any Row for Stock Option Chain)</div>
+    <div>All 30 Sensex + Nifty Heavyweights — 3-Index Attribution, Futures Buildup, ITM Institutional Flow &amp; Greeks</div>
     <div class="cyan">Click Any Stock Row Below &#8595;</div>
   </div>
-  <div class="chain-wrap" style="max-height:320px; margin-bottom:12px;">
+  <div class="chain-wrap" style="max-height:280px; margin-bottom:12px;">
     <table>
       <thead>
         <tr>
-          <th>STOCK</th><th>LTP</th><th>CHG %</th><th>NIFTY PTS</th><th>BN PTS</th><th>SENSEX PTS</th>
-          <th>FUTURES BUILDUP</th><th>ATM IV%</th><th>ATM Δ / Γ</th><th>INSTITUTIONAL OPTION SIGNAL</th>
+          <th>STOCK</th><th>LTP</th><th>CHG %</th><th>NIFTY</th><th>BN</th><th>SENSEX</th>
+          <th>FUTURES BUILDUP</th><th>ITM INSTITUTIONAL FLOW</th><th>ATM IV%</th><th>ACTIONABLE SIGNAL</th>
         </tr>
       </thead>
       <tbody id="all30Body"></tbody>
@@ -643,7 +702,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div id="stkChainTitle" style="color:#fbbf24; font-size:14px;">Select Any Stock Above to Inspect Its Live Option Chain &amp; Greeks</div>
       <div id="stkChainMeta" class="cyan"></div>
     </div>
-    <div class="chain-wrap" style="max-height:280px;">
+    <div class="chain-wrap" style="max-height:260px;">
       <table>
         <thead>
           <tr>
@@ -757,7 +816,7 @@ function renderStockChain() {
   const hw = (STATE.heavyweights || []).find(x => x.sym === SELECTED_STOCK);
   document.getElementById('stkChainTitle').innerText = `${SELECTED_STOCK} — Live Stock Option Chain & Greeks (Positional & Intraday)`;
   if (hw) {
-    document.getElementById('stkChainMeta').innerText = `Spot: ₹${hw.lp} (${hw.chg_pct>=0?'+':''}${hw.chg_pct}%) | ${hw.buildup} | ${hw.stk_signal}`;
+    document.getElementById('stkChainMeta').innerText = `Spot: ₹${hw.lp} (${hw.chg_pct>=0?'+':''}${hw.chg_pct}%) | ${hw.buildup} | ${hw.itm_tag}`;
   }
   if (!sc || !sc.rows || !sc.rows.length) {
     document.getElementById('stkChainBody').innerHTML = `<tr><td colspan="11">Loading ${SELECTED_STOCK} option strikes...</td></tr>`;
@@ -865,6 +924,32 @@ function renderAll(data) {
     <div class="card"><div class="idx-title">SENSEX POSITIONAL (3–15D)</div><div class="metric-val green">Max Pain: ${data.chains.SX.max_pain} | PCR: ${data.chains.SX.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.SX.atm_iv}% | Net GEX: ${data.chains.SX.net_gex_cr} Cr</div></div>
   `;
 
+  // Top 2 Bull & Top 2 Bear Cards
+  let top4Html = '';
+  (d.top2_bull || []).forEach((b, idx) => {
+    top4Html += `<div class="bull-card" onclick="selectStock('${b.sym}')">
+      <div style="display:flex; justify-content:space-between; font-weight:800; font-size:13px;">
+        <span class="green">&#9650; TOP BULL #${idx+1}: ${b.sym} (₹${b.lp} | +${b.chg_pct}%)</span>
+        <span class="badge b-buy">${b.itm_tag}</span>
+      </div>
+      <div style="font-size:11.5px; color:#cbd5e1; margin-top:4px;"><strong>Horizon:</strong> ${b.horizon} | <strong>Futures:</strong> ${b.buildup}</div>
+      <div style="font-size:12px; color:#fef08a; font-weight:800; margin-top:4px;">TRADE: ${b.stk_signal}</div>
+      <div style="font-size:11px; color:#94a3b8; margin-top:3px;">${b.exit_rule}</div>
+    </div>`;
+  });
+  (d.top2_bear || []).forEach((b, idx) => {
+    top4Html += `<div class="bear-card" onclick="selectStock('${b.sym}')">
+      <div style="display:flex; justify-content:space-between; font-weight:800; font-size:13px;">
+        <span class="red">&#9660; TOP BEAR #${idx+1}: ${b.sym} (₹${b.lp} | ${b.chg_pct}%)</span>
+        <span class="badge b-sell">${b.itm_tag}</span>
+      </div>
+      <div style="font-size:11.5px; color:#cbd5e1; margin-top:4px;"><strong>Horizon:</strong> ${b.horizon} | <strong>Futures:</strong> ${b.buildup}</div>
+      <div style="font-size:12px; color:#fef08a; font-weight:800; margin-top:4px;">TRADE: ${b.stk_signal}</div>
+      <div style="font-size:11px; color:#94a3b8; margin-top:3px;">${b.exit_rule}</div>
+    </div>`;
+  });
+  document.getElementById('top4Grid').innerHTML = top4Html;
+
   let t3Html = '';
   hws.forEach(h => {
     const c = h.chg_pct >= 0 ? 'green' : 'red';
@@ -876,8 +961,8 @@ function renderAll(data) {
       <td class="${h.bn_pts>=0?'green':'red'}">${h.bn_pts>=0?'+':''}${h.bn_pts}</td>
       <td class="${h.sensex_pts>=0?'green':'red'}">${h.sensex_pts>=0?'+':''}${h.sensex_pts}</td>
       <td class="cyan">${h.buildup}</td>
+      <td class="amber" style="font-weight:700;">${h.itm_tag}</td>
       <td>${h.atm_iv}%</td>
-      <td>${h.atm_delta} / ${h.atm_gamma}</td>
       <td><span class="badge ${h.chg_pct>=0?'b-buy':'b-sell'}">${h.stk_signal}</span></td>
     </tr>`;
   });
