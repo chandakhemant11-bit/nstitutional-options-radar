@@ -97,6 +97,7 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
             "pcr": 1.0, "atm_iv": 13.5, "ce_atm_iv": 13.5, "pe_atm_iv": 13.5,
             "sweep_bias": 0.0, "tot_ce_oi": 0, "tot_pe_oi": 0,
             "atm_strike": 0, "atm_ce_lp": 0, "atm_pe_lp": 0,
+            "synth_fut": 0.0, "synth_vs_spot": 0.0, "synth_bias": "NEUTRAL",
             "call_wall": 0, "put_wall": 0, "itm_flow": "BALANCED"
         }
     T = max(dte_days, 0.25) / 365.0
@@ -188,6 +189,16 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
             "ce_act": ce_act, "pe_act": pe_act
         })
 
+    # Synthetic Future = ATM Strike + ATM CE LTP - ATM PE LTP
+    synth_fut = round(atm_strike + atm_ce_lp - atm_pe_lp, 2) if atm_strike > 0 else round(spot, 2)
+    synth_vs_spot = round(synth_fut - spot, 1)
+    if synth_vs_spot > (step * 0.25):
+        synth_bias = "BULLISH SYNTHETIC LEAD"
+    elif synth_vs_spot < -(step * 0.25):
+        synth_bias = "BEARISH SYNTHETIC LEAD"
+    else:
+        synth_bias = "PARITY / BALANCED"
+
     max_pain = atm_strike
     min_loss = float("inf")
     for test_k in strikes:
@@ -237,6 +248,9 @@ def enrich_chain(raw_rows, spot, step=50, lot_size=75, dte_days=3.5):
         "atm_strike": atm_strike,
         "atm_ce_lp": atm_ce_lp,
         "atm_pe_lp": atm_pe_lp,
+        "synth_fut": synth_fut,
+        "synth_vs_spot": synth_vs_spot,
+        "synth_bias": synth_bias,
         "call_wall": call_wall_k or (atm_strike + 4 * step),
         "put_wall": put_wall_k or (atm_strike - 4 * step),
         "itm_flow": itm_flow
@@ -307,40 +321,35 @@ def compute_decision_engine(state):
         c_wall_stk = sc_obj["call_wall"] if (sc_obj and sc_obj["call_wall"] > 0) else round(stk_lp * 1.025, 0)
         p_wall_stk = sc_obj["put_wall"] if (sc_obj and sc_obj["put_wall"] > 0) else round(stk_lp * 0.975, 0)
 
-        if sc_obj and sc_obj["itm_flow"] != "BALANCED ITM FLOW":
-            itm_tag = sc_obj["itm_flow"]
-        elif chg > 0.75 and f_doi > 0:
-            itm_tag = "ITM CALL BUYING (INSTITUTIONAL)"
-        elif chg < -0.75 and f_doi > 0:
-            itm_tag = "ITM PUT BUYING (BEARISH)"
-        elif chg > 0.65 and f_doi < 0:
-            itm_tag = "ITM WRITERS TRAPPED (SQUEEZE)"
-        else:
-            itm_tag = "NEUTRAL ITM FLOW"
-
-        if chg > 0.85 and f_doi > 0:
-            horizon = "BOTH: INTRADAY 2%+ BREAKOUT & POSITIONAL (3–15D)"
-            stk_sig = f"BUY {atm_k_stk} CE (1-ITM/ATM) | BULL SPREAD"
-            exit_rule = f"EXIT IF: Fut OI starts unwinding or price slips below ₹{round(stk_lp * 0.992, 1)} (Book Partial at Call Wall ₹{c_wall_stk})"
-            bull_score = (chg * 12) + (abs(n_imp) * 3) + (15 if f_doi > 0 else 0) + (vel_30s * 20)
-            bear_score = -999
-        elif chg < -0.85 and f_doi > 0:
-            horizon = "BOTH: INTRADAY 2%+ BREAKDOWN & POSITIONAL (3–15D)"
-            stk_sig = f"BUY {atm_k_stk} PE (1-ITM/ATM) | BEAR SPREAD"
-            exit_rule = f"EXIT IF: Fut OI covers or price reclaims ₹{round(stk_lp * 1.008, 1)} (Book Partial at Put Wall ₹{p_wall_stk})"
-            bear_score = (abs(chg) * 12) + (abs(n_imp) * 3) + (15 if f_doi > 0 else 0) + (abs(vel_30s) * 20)
-            bull_score = -999
-        elif chg >= 0:
-            horizon = "INTRADAY SCALP / SELL OTM PUT"
-            stk_sig = f"SELL {p_wall_stk} PE (THETA)"
-            exit_rule = f"EXIT IF: Price breaks Put Support Wall ₹{p_wall_stk}"
-            bull_score = (chg * 10) + (abs(n_imp) * 2)
+        # Bullish Rule: If GREEN (chg > 0) or LONG BUILDUP -> ONLY BUY CALL / BULL SPREAD or SELL OTM PUT (NEVER SELL CALL)
+        # Bearish Rule: If RED (chg < 0) or SHORT BUILDUP -> ONLY BUY PUT / BEAR SPREAD or SELL OTM CALL (NEVER SELL PUT)
+        if chg > 0 or buildup == "LONG BUILDUP":
+            is_bullish_stock = True
+            if buildup == "LONG BUILDUP" or chg >= 0.45:
+                itm_tag = "ITM CALL BUYING (INSTITUTIONAL)"
+                horizon = "BOTH: INTRADAY 2%+ BREAKOUT & POSITIONAL (3–15D)"
+                stk_sig = f"BUY {atm_k_stk} CE / BULL SPREAD"
+                exit_rule = f"EXIT IF: Fut OI unwinds or price slips below ₹{round(stk_lp * 0.992, 1)} (Book at Call Wall ₹{c_wall_stk})"
+            else:
+                itm_tag = "BULLISH SUPPORT (PUT WRITING)"
+                horizon = "INTRADAY / POSITIONAL THETA SELL"
+                stk_sig = f"SELL OTM PUT ({p_wall_stk} PE)"
+                exit_rule = f"EXIT IF: Price breaks Put Support Wall ₹{p_wall_stk}"
+            bull_score = (max(chg, 0.05) * 12) + (abs(n_imp) * 3) + (18 if buildup == "LONG BUILDUP" else 8) + (vel_30s * 20)
             bear_score = -999
         else:
-            horizon = "INTRADAY SCALP / SELL OTM CE"
-            stk_sig = f"SELL {c_wall_stk} CE (THETA)"
-            exit_rule = f"EXIT IF: Price breaks Call Resistance Wall ₹{c_wall_stk}"
-            bear_score = (abs(chg) * 10) + (abs(n_imp) * 2)
+            is_bullish_stock = False
+            if buildup == "SHORT BUILDUP" or chg <= -0.45:
+                itm_tag = "ITM PUT BUYING (BEARISH)"
+                horizon = "BOTH: INTRADAY 2%+ BREAKDOWN & POSITIONAL (3–15D)"
+                stk_sig = f"BUY {atm_k_stk} PE / BEAR SPREAD"
+                exit_rule = f"EXIT IF: Fut OI covers or price reclaims ₹{round(stk_lp * 1.008, 1)} (Book at Put Wall ₹{p_wall_stk})"
+            else:
+                itm_tag = "BEARISH RESISTANCE (CALL WRITING)"
+                horizon = "INTRADAY / POSITIONAL THETA SELL"
+                stk_sig = f"SELL OTM CALL ({c_wall_stk} CE)"
+                exit_rule = f"EXIT IF: Price breaks Call Resistance Wall ₹{c_wall_stk}"
+            bear_score = (max(abs(chg), 0.05) * 12) + (abs(n_imp) * 3) + (18 if buildup == "SHORT BUILDUP" else 8) + (abs(vel_30s) * 20)
             bull_score = -999
 
         item = dict(h)
@@ -356,15 +365,15 @@ def compute_decision_engine(state):
             "horizon": horizon,
             "stk_signal": stk_sig,
             "exit_rule": exit_rule,
+            "is_bullish_stock": is_bullish_stock,
             "bull_score": bull_score,
             "bear_score": bear_score
         })
         enriched_hws.append(item)
 
-    # Anti-Flicker Lock for Top 2 Bull & Top 2 Bear (Requires 12 consecutive cycles to swap names)
     hw_by_sym = {x["sym"]: x for x in enriched_hws}
-    raw_bull_syms = [x["sym"] for x in sorted([x for x in enriched_hws if x["chg_pct"] > 0], key=lambda x: x["bull_score"], reverse=True)[:2]]
-    raw_bear_syms = [x["sym"] for x in sorted([x for x in enriched_hws if x["chg_pct"] < 0], key=lambda x: x["bear_score"], reverse=True)[:2]]
+    raw_bull_syms = [x["sym"] for x in sorted([x for x in enriched_hws if x["is_bullish_stock"]], key=lambda x: x["bull_score"], reverse=True)[:2]]
+    raw_bear_syms = [x["sym"] for x in sorted([x for x in enriched_hws if not x["is_bullish_stock"]], key=lambda x: x["bear_score"], reverse=True)[:2]]
 
     if not TOP4_LOCK["bull_syms"]:
         TOP4_LOCK["bull_syms"] = raw_bull_syms
@@ -400,7 +409,6 @@ def compute_decision_engine(state):
     enriched_hws.sort(key=lambda x: abs(x["nifty_pts"]), reverse=True)
     top_movers = [f"{x['sym']} ({'+' if x['nifty_pts']>=0 else ''}{x['nifty_pts']}p)" for x in enriched_hws[:3]]
 
-    # 80/20 Regime & Side-Specific Gamma Blast Engine
     gex = n_chain["net_gex_cr"]
     pcr = n_chain["pcr"]
     iv = n_chain["atm_iv"]
@@ -411,26 +419,28 @@ def compute_decision_engine(state):
     c_wall = n_chain["call_wall"]
     p_wall = n_chain["put_wall"]
     mp = n_chain["max_pain"]
+    synth_n = n_chain["synth_fut"]
+    synth_diff = n_chain["synth_vs_spot"]
     total_hws = max(len(enriched_hws), 1)
     breadth_ratio = green_cnt / total_hws
     dist_mp_pct = (abs(n_spot - mp) / max(n_spot, 1)) * 100.0
 
     if gex < -150 and (breadth_ratio >= 0.70 or breadth_ratio <= 0.30) and iv >= 14.2:
-        if breadth_ratio >= 0.70 and (pcr >= 1.02 or sweep > 8):
+        if breadth_ratio >= 0.70 and (pcr >= 1.02 or sweep > 8 or synth_diff > 10):
             raw_key = "GAMMA_BUY_CE"
             regime = "20% GAMMA EXPANSION ZONE (CALL-SIDE EXPLOSION)"
             regime_color = "#10b981"
             action = f"CALL-SIDE GAMMA BLAST: EXIT SHORT CALLS (CE) IMMEDIATELY -> STRONG BUY {atm_k} CE"
-            sub = f"Negative GEX ({gex} Cr) + {green_cnt}/{total_hws} Stocks Surging (Nifty {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)}p, BN {'+' if bn_pts>=0 else ''}{round(bn_pts,1)}p) | Keep Short PE with Trailing SL"
+            sub = f"Negative GEX ({gex} Cr) + Synth Fut {synth_n} ({'+' if synth_diff>=0 else ''}{synth_diff}p) + {green_cnt}/{total_hws} Stocks Surging | Keep Short PE with Trailing SL"
             trade_card = f"BUY {atm_k} CE @ ₹{atm_ce} | SL: ₹{round(atm_ce*0.78,1)} | Target: ₹{round(atm_ce*1.48,1)} | URGENT: Square-Off Any Short CE Leg!"
             banner_bg = "linear-gradient(90deg, #064e3b, #047857)"
             border_c = "#10b981"
-        elif breadth_ratio <= 0.30 and (pcr <= 0.95 or sweep < -8):
+        elif breadth_ratio <= 0.30 and (pcr <= 0.95 or sweep < -8 or synth_diff < -10):
             raw_key = "GAMMA_BUY_PE"
             regime = "20% GAMMA CRASH ZONE (PUT-SIDE EXPLOSION)"
             regime_color = "#ef4444"
             action = f"PUT-SIDE GAMMA CRASH: EXIT SHORT PUTS (PE) IMMEDIATELY -> STRONG BUY {atm_k} PE"
-            sub = f"Negative GEX ({gex} Cr) + Heavyweight Selloff ({green_cnt}/{total_hws} Green, Nifty {round(nifty_pts,1)}p, BN {round(bn_pts,1)}p) | Short CE Leg Safe"
+            sub = f"Negative GEX ({gex} Cr) + Synth Fut {synth_n} ({synth_diff}p) + Heavyweight Selloff ({green_cnt}/{total_hws} Green) | Short CE Leg Safe"
             trade_card = f"BUY {atm_k} PE @ ₹{atm_pe} | SL: ₹{round(atm_pe*0.78,1)} | Target: ₹{round(atm_pe*1.48,1)} | URGENT: Square-Off Any Short PE Leg!"
             banner_bg = "linear-gradient(90deg, #7f1d1d, #b91c1c)"
             border_c = "#ef4444"
@@ -450,7 +460,7 @@ def compute_decision_engine(state):
             regime_color = "#38bdf8"
             comb_prem = round(atm_ce + atm_pe, 1)
             action = f"SELL ATM STRADDLE ({atm_k} CE + {atm_k} PE) — DEALERS PINNING MARKET"
-            sub = f"Strong Positive GEX (+{gex} Cr) + Spot Pinned Near Max Pain {mp} + Balanced Heavyweights ({green_cnt}/{total_hws} Green)"
+            sub = f"Strong Positive GEX (+{gex} Cr) + Synth Fut {synth_n} Pinned Near Max Pain {mp} + Balanced Heavyweights ({green_cnt}/{total_hws} Green)"
             trade_card = f"SELL {atm_k} CE (₹{atm_ce}) + SELL {atm_k} PE (₹{atm_pe}) | Combined Prem: ₹{comb_prem} | Combined SL: ₹{round(comb_prem*1.22,1)}"
             banner_bg = "linear-gradient(90deg, #1e3a8a, #1d4ed8)"
             border_c = "#60a5fa"
@@ -459,7 +469,7 @@ def compute_decision_engine(state):
             regime = "80% SELLER REWARD ZONE — BULLISH PUT WRITING SUPPORT"
             regime_color = "#34d399"
             action = f"SELL OTM PUT / BULL PUT SPREAD BELOW {p_wall} PE (AVOID SHORTING CALLS)"
-            sub = f"Positive GEX (+{gex} Cr) + Strong Put Support Wall at {p_wall} (PCR {pcr}) + Nifty {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)} pts"
+            sub = f"Positive GEX (+{gex} Cr) + Synth Fut {synth_n} + Strong Put Wall at {p_wall} (PCR {pcr})"
             trade_card = f"SELL {p_wall} PE + BUY {p_wall - 200} PE (Bull Put Credit Spread) | High Theta Win Probability"
             banner_bg = "linear-gradient(90deg, #065f46, #0f766e)"
             border_c = "#34d399"
@@ -468,7 +478,7 @@ def compute_decision_engine(state):
             regime = "80% SELLER REWARD ZONE — BEARISH CALL WRITING WALL"
             regime_color = "#fb7185"
             action = f"SELL OTM CALL / BEAR CALL SPREAD ABOVE {c_wall} CE (AVOID SHORTING PUTS)"
-            sub = f"Heavy Call Resistance Wall at {c_wall} (PCR {pcr}) + Weak Heavyweights ({green_cnt}/{total_hws} Green, Nifty {round(nifty_pts,1)} pts)"
+            sub = f"Heavy Call Resistance Wall at {c_wall} (PCR {pcr}) + Synth Fut {synth_n} + Weak Heavyweights ({green_cnt}/{total_hws} Green)"
             trade_card = f"SELL {c_wall} CE + BUY {c_wall + 200} CE (Bear Call Credit Spread) | High Theta Win Probability"
             banner_bg = "linear-gradient(90deg, #881337, #9f1239)"
             border_c = "#fb7185"
@@ -477,7 +487,7 @@ def compute_decision_engine(state):
             regime = "80% SELLER REWARD ZONE — RANGE-BOUND STRANGLE / IRON CONDOR"
             regime_color = "#38bdf8"
             action = f"SELL OTM STRANGLE / IRON CONDOR ({p_wall} PE & {c_wall} CE) — AVOID NAKED BUYING"
-            sub = f"Positive GEX (+{gex} Cr) Absorbing Moves Between Put Wall {p_wall} and Call Wall {c_wall} (Max Pain {mp})"
+            sub = f"Positive GEX (+{gex} Cr) + Synth Fut {synth_n} Absorbed Between Put Wall {p_wall} and Call Wall {c_wall} (Max Pain {mp})"
             trade_card = f"SELL {c_wall} CE + SELL {p_wall} PE (Safe Range: {c_wall - p_wall} pts) | Hedge Wings at ±200 pts for Margin Benefit"
             banner_bg = "linear-gradient(90deg, #1e3a8a, #0369a1)"
             border_c = "#38bdf8"
@@ -523,7 +533,7 @@ def compute_decision_engine(state):
         pos_reason = f"Elevated IV ({iv}%) offers rich 3–15 day theta decay; sell {c_wall} CE & {p_wall} PE outside Max Pain {mp}."
     else:
         pos_verdict = "POSITIONAL BULL PUT / RATIO SPREAD (3 TO 15 DAYS)"
-        pos_reason = f"F1 Basis +{basis_f1} pts | Net Nifty Impact {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)} pts | Sensex {'+' if sensex_pts>=0 else ''}{round(sensex_pts,1)} pts."
+        pos_reason = f"F1 Basis +{basis_f1} pts | Synth Fut {synth_n} | Net Nifty Impact {'+' if nifty_pts>=0 else ''}{round(nifty_pts,1)} pts | Sensex {'+' if sensex_pts>=0 else ''}{round(sensex_pts,1)} pts."
 
     return {
         "micro": state.get("micro", {}),
@@ -567,7 +577,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>GammaShield v2.6 — Institutional Options, Futures & 30-Stock Terminal</title>
+<title>GammaShield v2.9 — Institutional Options, Futures, Synthetic & 30-Stock Terminal</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Roboto, Arial, sans-serif; }
   body { background: #070b14; color: #e2e8f0; padding: 12px 18px; font-size: 13px; }
@@ -596,16 +606,17 @@ HTML_PAGE = """<!DOCTYPE html>
   .bear-card { background: linear-gradient(135deg, #2d0b14, #0d1424); border: 1px solid #ef4444; border-left: 5px solid #ef4444; border-radius: 6px; padding: 10px 12px; cursor: pointer; }
   .idx-title { font-size: 11px; color: #94a3b8; font-weight: 700; }
   .idx-spot { font-size: 22px; font-weight: 800; color: #38bdf8; margin: 2px 0 6px 0; }
-  .fut-row { display: flex; justify-content: space-between; background: #131c31; padding: 5px 8px; border-radius: 4px; margin-top: 4px; font-size: 11.5px; }
+  .fut-row { display: flex; justify-content: space-between; background: #131c31; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 11.5px; }
+  .synth-row { display: flex; justify-content: space-between; background: #1e1b4b; border: 1px solid #4338ca; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 11.5px; }
   .section-hdr { display: flex; justify-content: space-between; align-items: center; margin: 10px 0 6px 0; font-weight: 700; color: #cbd5e1; font-size: 12.5px; }
   .hw-strip { display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; margin-bottom: 10px; }
   .hw-box { background: #0f172a; border: 1px solid #1e293b; border-radius: 5px; padding: 6px; cursor: pointer; transition: 0.15s; }
   .hw-box:hover { border-color: #38bdf8; background: #16223b; }
   .green { color: #34d399; } .red { color: #f87171; } .amber { color: #fbbf24; } .cyan { color: #38bdf8; }
-  .metrics-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+  .metrics-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 8px; }
   .metric-box { background: #0f172a; border: 1px solid #1e293b; padding: 7px 10px; border-radius: 5px; }
   .metric-lbl { font-size: 10.5px; color: #94a3b8; }
-  .metric-val { font-size: 13.5px; font-weight: 700; color: #f8fafc; margin-top: 2px; }
+  .metric-val { font-size: 13px; font-weight: 700; color: #f8fafc; margin-top: 2px; }
   .idx-switch button { background: #1e293b; color: #cbd5e1; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-weight: 700; margin-left: 4px; }
   .idx-switch button.active { background: #f59e0b; color: #000; }
   .chain-wrap { max-height: 440px; overflow-y: auto; border: 1px solid #1e293b; border-radius: 6px; }
@@ -632,7 +643,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 
 <div class="topbar">
-  <div class="brand">&#9724; GammaShield <span>v2.6</span> — 80/20 Institutional Options, Futures &amp; 30-Stock Terminal</div>
+  <div class="brand">&#9724; GammaShield <span>v2.9</span> — 80/20 Institutional Options, Futures, Synthetic &amp; 30-Stock Terminal</div>
   <div>
     <button id="muteBtn" class="mute-btn" onclick="toggleSound()">&#128266; CHIME ON</button>
     <span id="tpsBadge" style="color:#94a3b8; margin-right:10px; font-size:11.5px;">0 ticks/s</span>
@@ -663,7 +674,6 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="trade-box" id="tradeCard">READY-TO-EXECUTE STRIKE BUILDER LOADING...</div>
 </div>
 
-<!-- TAB 1: INTRADAY EXECUTION & FULL 25-STRIKE OPTION CHAIN WITH OI BARS -->
 <div id="tab1">
   <div class="idx-grid" id="idxCards"></div>
 
@@ -674,7 +684,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="hw-strip" id="top10Strip"></div>
 
   <div class="section-hdr">
-    <div>Microstructure Greeks, Net GEX, Gamma Flip &amp; Full ATM ±12 Option Chain (25 Strikes + Visual OI Walls)</div>
+    <div>Microstructure Greeks, Net GEX, Gamma Flip, Synthetic Future &amp; Full ATM ±12 Option Chain (25 Strikes)</div>
     <div class="idx-switch">
       <button class="active" onclick="setActiveIdx('NIFTY', this)">NIFTY (25)</button>
       <button onclick="setActiveIdx('BN', this)">BANKNIFTY (25)</button>
@@ -704,7 +714,6 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- TAB 2: POSITIONAL SWING & TERM-STRUCTURE SHIELD (3-15 DAYS) -->
 <div id="tab2" class="hidden">
   <div class="card" style="margin-bottom:10px; border-left:4px solid #38bdf8;">
     <div style="font-size:14px; font-weight:800; color:#38bdf8;" id="posVerdict">POSITIONAL REGIME VERDICT</div>
@@ -713,10 +722,9 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="idx-grid" id="posGrid"></div>
 </div>
 
-<!-- TAB 3: TOP 2 BULL / TOP 2 BEAR RADAR + ALL 30 STOCKS + ITM FLOW + CLICK-ON-STOCK OPTION CHAIN -->
 <div id="tab3" class="hidden">
   <div class="section-hdr" style="margin-top:0;">
-    <div style="color:#fbbf24;">&#9889; INSTITUTIONAL 2%+ STOCK BREAKOUT &amp; EXIT RADAR (ANTI-FLICKER LOCKED — CLICK CARD FOR OPTION CHAIN)</div>
+    <div style="color:#fbbf24;">&#9889; INSTITUTIONAL 2%+ STOCK BREAKOUT &amp; EXIT RADAR (STRICT BULL/BEAR RULE LOCKED — CLICK CARD FOR OPTION CHAIN)</div>
     <div class="cyan">Intraday Momentum + 3–15D Positional Carry</div>
   </div>
   <div class="top4-grid" id="top4Grid"></div>
@@ -817,7 +825,8 @@ function renderChain() {
   if (!ch) return;
   document.getElementById('chainMetrics').innerHTML = `
     <div class="metric-box"><div class="metric-lbl">NET GEX &amp; GAMMA FLIP</div><div class="metric-val cyan">${ch.net_gex_cr} Cr | Flip: ${fmtNum(ch.gamma_flip)}</div></div>
-    <div class="metric-box"><div class="metric-lbl">ATM IV &amp; ORDER SWEEP</div><div class="metric-val amber">IV: ${ch.atm_iv}% | Sweep: ${ch.sweep_bias}%</div></div>
+    <div class="metric-box"><div class="metric-lbl">SYNTHETIC FUTURE (ATM ${ch.atm_strike})</div><div class="metric-val amber">${fmtNum(ch.synth_fut)} (${ch.synth_vs_spot>=0?'+':''}${ch.synth_vs_spot}p)</div></div>
+    <div class="metric-box"><div class="metric-lbl">ATM IV &amp; ORDER SWEEP</div><div class="metric-val">IV: ${ch.atm_iv}% | Sweep: ${ch.sweep_bias}%</div></div>
     <div class="metric-box"><div class="metric-lbl">MAX PAIN &amp; PCR</div><div class="metric-val green">Max Pain: ${fmtNum(ch.max_pain)} | PCR: ${ch.pcr}</div></div>
     <div class="metric-box"><div class="metric-lbl">OI WALLS (CALL / PUT)</div><div class="metric-val">CE: ${fmtNum(ch.call_wall)} | PE: ${fmtNum(ch.put_wall)}</div></div>
   `;
@@ -854,7 +863,7 @@ function renderChain() {
 function renderStockChain() {
   const sc = (STATE.stock_chains || {})[SELECTED_STOCK];
   const hw = (STATE.heavyweights || []).find(x => x.sym === SELECTED_STOCK);
-  document.getElementById('stkChainTitle').innerText = `${SELECTED_STOCK} — Live Stock Option Chain & Greeks (Positional & Intraday)`;
+  document.getElementById('stkChainTitle').innerText = `${SELECTED_STOCK} — Live Stock Option Chain & Greeks (Synth Fut: ₹${sc ? sc.synth_fut : '--'})`;
   if (hw) {
     document.getElementById('stkChainMeta').innerText = `Spot: ₹${hw.lp} (${hw.chg_pct>=0?'+':''}${hw.chg_pct}%) | ${hw.buildup} | ${hw.itm_tag}`;
   }
@@ -923,22 +932,26 @@ function renderAll(data) {
   }
 
   const idxDefs = [
-    {title: 'NIFTY 50 SPOT', sp: 'NIFTY_SPOT', f1: 'NIFTY_F1', f2: 'NIFTY_F2'},
-    {title: 'BANKNIFTY SPOT', sp: 'BN_SPOT', f1: 'BN_F1', f2: 'BN_F2'},
-    {title: 'SENSEX SPOT', sp: 'SX_SPOT', f1: 'SX_F1', f2: 'SX_F2'}
+    {title: 'NIFTY 50 SPOT', sp: 'NIFTY_SPOT', f1: 'NIFTY_F1', f2: 'NIFTY_F2', ckey: 'NIFTY'},
+    {title: 'BANKNIFTY SPOT', sp: 'BN_SPOT', f1: 'BN_F1', f2: 'BN_F2', ckey: 'BN'},
+    {title: 'SENSEX SPOT', sp: 'SX_SPOT', f1: 'SX_F1', f2: 'SX_F2', ckey: 'SX'}
   ];
   let cardsHtml = '';
   idxDefs.forEach(x => {
     const sp = (t[x.sp] || {}).lp || 0;
     const f1 = t[x.f1] || {};
     const f2 = t[x.f2] || {};
+    const chObj = (data.chains || {})[x.ckey] || {};
     const b1 = (f1.lp && sp) ? (f1.lp - sp).toFixed(1) : '0.0';
     const b2 = (f2.lp && sp) ? (f2.lp - sp).toFixed(1) : '0.0';
+    const syn = chObj.synth_fut || 0;
+    const synDiff = chObj.synth_vs_spot || 0;
     cardsHtml += `<div class="card">
       <div class="idx-title">${x.title}</div>
       <div class="idx-spot">${Number(sp).toLocaleString('en-IN', {minimumFractionDigits:2})}</div>
       <div class="fut-row"><span>${f1.tsym || 'NEAR FUT'} (OI ${fmtNum(f1.oi)})</span><span class="green">${f1.lp || 0} (Basis +${b1})</span></div>
       <div class="fut-row"><span>${f2.tsym || 'NEXT FUT'} (OI ${fmtNum(f2.oi)})</span><span class="cyan">${f2.lp || 0} (Basis +${b2})</span></div>
+      <div class="synth-row"><span style="color:#a5b4fc; font-weight:700;">SYNTHETIC FUT (ATM ${chObj.atm_strike || '--'})</span><span class="amber" style="font-weight:800;">${Number(syn).toLocaleString('en-IN', {minimumFractionDigits:2})} (${synDiff>=0?'+':''}${synDiff}p | ${chObj.synth_bias || 'PARITY'})</span></div>
     </div>`;
   });
   document.getElementById('idxCards').innerHTML = cardsHtml;
@@ -959,9 +972,9 @@ function renderAll(data) {
   document.getElementById('posVerdict').innerText = d.pos_verdict;
   document.getElementById('posReason').innerText = d.pos_reason;
   document.getElementById('posGrid').innerHTML = `
-    <div class="card"><div class="idx-title">NIFTY POSITIONAL (3–15D)</div><div class="metric-val cyan">Max Pain: ${data.chains.NIFTY.max_pain} | PCR: ${data.chains.NIFTY.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.NIFTY.atm_iv}% | F1–F2 Roll Spread: +${d.roll_spread} pts</div></div>
-    <div class="card"><div class="idx-title">BANKNIFTY POSITIONAL (3–15D)</div><div class="metric-val amber">Max Pain: ${data.chains.BN.max_pain} | PCR: ${data.chains.BN.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.BN.atm_iv}% | Net GEX: ${data.chains.BN.net_gex_cr} Cr</div></div>
-    <div class="card"><div class="idx-title">SENSEX POSITIONAL (3–15D)</div><div class="metric-val green">Max Pain: ${data.chains.SX.max_pain} | PCR: ${data.chains.SX.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.SX.atm_iv}% | Net GEX: ${data.chains.SX.net_gex_cr} Cr</div></div>
+    <div class="card"><div class="idx-title">NIFTY POSITIONAL (3–15D)</div><div class="metric-val cyan">Max Pain: ${data.chains.NIFTY.max_pain} | PCR: ${data.chains.NIFTY.pcr}</div><div style="margin-top:6px;">Synth Fut: ${data.chains.NIFTY.synth_fut} | ATM IV: ${data.chains.NIFTY.atm_iv}%</div></div>
+    <div class="card"><div class="idx-title">BANKNIFTY POSITIONAL (3–15D)</div><div class="metric-val amber">Max Pain: ${data.chains.BN.max_pain} | PCR: ${data.chains.BN.pcr}</div><div style="margin-top:6px;">Synth Fut: ${data.chains.BN.synth_fut} | ATM IV: ${data.chains.BN.atm_iv}%</div></div>
+    <div class="card"><div class="idx-title">SENSEX POSITIONAL (3–15D)</div><div class="metric-val green">Max Pain: ${data.chains.SX.max_pain} | PCR: ${data.chains.SX.pcr}</div><div style="margin-top:6px;">Synth Fut: ${data.chains.SX.synth_fut} | ATM IV: ${data.chains.SX.atm_iv}%</div></div>
   `;
 
   let top4Html = '';
@@ -1002,7 +1015,7 @@ function renderAll(data) {
       <td class="cyan">${h.buildup}</td>
       <td class="amber" style="font-weight:700;">${h.itm_tag}</td>
       <td>${h.atm_iv}%</td>
-      <td><span class="badge ${h.chg_pct>=0?'b-buy':'b-sell'}">${h.stk_signal}</span></td>
+      <td><span class="badge ${h.is_bullish_stock?'b-buy':'b-sell'}">${h.stk_signal}</span></td>
     </tr>`;
   });
   document.getElementById('all30Body').innerHTML = t3Html;
