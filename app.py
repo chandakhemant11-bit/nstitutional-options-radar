@@ -23,6 +23,15 @@ SIGNAL_LOCK = {
     "prev_action": ""
 }
 
+TOP4_LOCK = {
+    "bull_syms": [],
+    "bear_syms": [],
+    "cand_bull": [],
+    "cand_bull_cnt": 0,
+    "cand_bear": [],
+    "cand_bear_cnt": 0
+}
+
 BANK_STOCKS = {"HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "INDUSINDBK"}
 BANK_WEIGHTS = {
     "HDFCBANK": 29.0, "ICICIBANK": 24.5, "SBIN": 10.5,
@@ -298,7 +307,6 @@ def compute_decision_engine(state):
         c_wall_stk = sc_obj["call_wall"] if (sc_obj and sc_obj["call_wall"] > 0) else round(stk_lp * 1.025, 0)
         p_wall_stk = sc_obj["put_wall"] if (sc_obj and sc_obj["put_wall"] > 0) else round(stk_lp * 0.975, 0)
 
-        # ITM Institutional Flow Classification
         if sc_obj and sc_obj["itm_flow"] != "BALANCED ITM FLOW":
             itm_tag = sc_obj["itm_flow"]
         elif chg > 0.75 and f_doi > 0:
@@ -310,7 +318,6 @@ def compute_decision_engine(state):
         else:
             itm_tag = "NEUTRAL ITM FLOW"
 
-        # Intraday vs Positional Classification + Data Exit Rule
         if chg > 0.85 and f_doi > 0:
             horizon = "BOTH: INTRADAY 2%+ BREAKOUT & POSITIONAL (3–15D)"
             stk_sig = f"BUY {atm_k_stk} CE (1-ITM/ATM) | BULL SPREAD"
@@ -354,8 +361,41 @@ def compute_decision_engine(state):
         })
         enriched_hws.append(item)
 
-    top2_bull = sorted([x for x in enriched_hws if x["chg_pct"] > 0], key=lambda x: x["bull_score"], reverse=True)[:2]
-    top2_bear = sorted([x for x in enriched_hws if x["chg_pct"] < 0], key=lambda x: x["bear_score"], reverse=True)[:2]
+    # Anti-Flicker Lock for Top 2 Bull & Top 2 Bear (Requires 12 consecutive cycles to swap names)
+    hw_by_sym = {x["sym"]: x for x in enriched_hws}
+    raw_bull_syms = [x["sym"] for x in sorted([x for x in enriched_hws if x["chg_pct"] > 0], key=lambda x: x["bull_score"], reverse=True)[:2]]
+    raw_bear_syms = [x["sym"] for x in sorted([x for x in enriched_hws if x["chg_pct"] < 0], key=lambda x: x["bear_score"], reverse=True)[:2]]
+
+    if not TOP4_LOCK["bull_syms"]:
+        TOP4_LOCK["bull_syms"] = raw_bull_syms
+    elif raw_bull_syms != TOP4_LOCK["bull_syms"]:
+        if raw_bull_syms == TOP4_LOCK["cand_bull"]:
+            TOP4_LOCK["cand_bull_cnt"] += 1
+        else:
+            TOP4_LOCK["cand_bull"] = raw_bull_syms
+            TOP4_LOCK["cand_bull_cnt"] = 1
+        if TOP4_LOCK["cand_bull_cnt"] >= 12:
+            TOP4_LOCK["bull_syms"] = raw_bull_syms
+            TOP4_LOCK["cand_bull_cnt"] = 0
+    else:
+        TOP4_LOCK["cand_bull_cnt"] = 0
+
+    if not TOP4_LOCK["bear_syms"]:
+        TOP4_LOCK["bear_syms"] = raw_bear_syms
+    elif raw_bear_syms != TOP4_LOCK["bear_syms"]:
+        if raw_bear_syms == TOP4_LOCK["cand_bear"]:
+            TOP4_LOCK["cand_bear_cnt"] += 1
+        else:
+            TOP4_LOCK["cand_bear"] = raw_bear_syms
+            TOP4_LOCK["cand_bear_cnt"] = 1
+        if TOP4_LOCK["cand_bear_cnt"] >= 12:
+            TOP4_LOCK["bear_syms"] = raw_bear_syms
+            TOP4_LOCK["cand_bear_cnt"] = 0
+    else:
+        TOP4_LOCK["cand_bear_cnt"] = 0
+
+    top2_bull = [hw_by_sym[s] for s in TOP4_LOCK["bull_syms"] if s in hw_by_sym]
+    top2_bear = [hw_by_sym[s] for s in TOP4_LOCK["bear_syms"] if s in hw_by_sym]
 
     enriched_hws.sort(key=lambda x: abs(x["nifty_pts"]), reverse=True)
     top_movers = [f"{x['sym']} ({'+' if x['nifty_pts']>=0 else ''}{x['nifty_pts']}p)" for x in enriched_hws[:3]]
@@ -676,7 +716,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <!-- TAB 3: TOP 2 BULL / TOP 2 BEAR RADAR + ALL 30 STOCKS + ITM FLOW + CLICK-ON-STOCK OPTION CHAIN -->
 <div id="tab3" class="hidden">
   <div class="section-hdr" style="margin-top:0;">
-    <div style="color:#fbbf24;">&#9889; INSTITUTIONAL 2%+ STOCK BREAKOUT &amp; EXIT RADAR (TOP 2 BULL &amp; TOP 2 BEAR — CLICK CARD FOR OPTION CHAIN)</div>
+    <div style="color:#fbbf24;">&#9889; INSTITUTIONAL 2%+ STOCK BREAKOUT &amp; EXIT RADAR (ANTI-FLICKER LOCKED — CLICK CARD FOR OPTION CHAIN)</div>
     <div class="cyan">Intraday Momentum + 3–15D Positional Carry</div>
   </div>
   <div class="top4-grid" id="top4Grid"></div>
@@ -924,12 +964,11 @@ function renderAll(data) {
     <div class="card"><div class="idx-title">SENSEX POSITIONAL (3–15D)</div><div class="metric-val green">Max Pain: ${data.chains.SX.max_pain} | PCR: ${data.chains.SX.pcr}</div><div style="margin-top:6px;">ATM IV: ${data.chains.SX.atm_iv}% | Net GEX: ${data.chains.SX.net_gex_cr} Cr</div></div>
   `;
 
-  // Top 2 Bull & Top 2 Bear Cards
   let top4Html = '';
   (d.top2_bull || []).forEach((b, idx) => {
     top4Html += `<div class="bull-card" onclick="selectStock('${b.sym}')">
       <div style="display:flex; justify-content:space-between; font-weight:800; font-size:13px;">
-        <span class="green">&#9650; TOP BULL #${idx+1}: ${b.sym} (₹${b.lp} | +${b.chg_pct}%)</span>
+        <span class="green">&#9650; TOP BULL #${idx+1}: ${b.sym} (₹${b.lp} | ${b.chg_pct>=0?'+':''}${b.chg_pct}%)</span>
         <span class="badge b-buy">${b.itm_tag}</span>
       </div>
       <div style="font-size:11.5px; color:#cbd5e1; margin-top:4px;"><strong>Horizon:</strong> ${b.horizon} | <strong>Futures:</strong> ${b.buildup}</div>
